@@ -1,0 +1,10 @@
+__pycache__/
+.pytest_cache/
+*.pyc
+.venv/
+*.egg-info/
+data/input/**
+data/output/**
+data/cura-config/**
+data/app/**
+!data/**/.gitkeep

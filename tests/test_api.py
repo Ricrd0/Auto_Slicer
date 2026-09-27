@@ -1,0 +1,85 @@
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+from auto_slicer.app import create_app
+from auto_slicer.meshio import write_stl
+from auto_slicer.paths import DataPaths
+from tests.support import write_printer_tree
+
+
+def _client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    config = tmp_path / "cura-config"
+    resources = tmp_path / "resources"
+    write_printer_tree(config, resources)
+    monkeypatch.setenv("CURA_ENGINE", str(tmp_path / "CuraEngine"))
+    monkeypatch.setenv("CURA_RESOURCES", str(resources))
+    paths = DataPaths(
+        input_dir=tmp_path / "input",
+        output_dir=tmp_path / "output",
+        cura_config_dir=config,
+        app_dir=tmp_path / "app",
+        frontend_dir=tmp_path / "frontend",
+        cura_root=None,
+    )
+    paths.input_dir.mkdir()
+    triangle = [((0.0, 0.0, 0.0), (20.0, 0.0, 0.0), (0.0, 10.0, 4.0))]
+    (paths.input_dir / "wall.stl").write_bytes(write_stl(triangle))
+    return TestClient(create_app(paths))
+
+
+def test_settings_pose_layout_and_bundle_upload(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _client(tmp_path, monkeypatch)
+    saved = client.put(
+        "/api/settings",
+        json={"output_folder_name": "building_1", "rotation_z": 90, "retraction_combing": "infill"},
+    )
+    assert saved.status_code == 200
+    assert saved.json()["output_folder_name"] == "building_1"
+    assert saved.json()["infill_pattern"] == "lightning"
+
+    printers = client.get("/api/printers").json()
+    shop = next(printer for printer in printers if printer["id"] == "shop_printer")
+    assert shop["version_mismatch"] is True
+    assert shop["machine_width"] == 220
+
+    pose = client.put("/api/poses", json={"path": "wall.stl", "position": [10, 12], "rotation": [0, 0, 90]})
+    assert pose.status_code == 200
+    layout = client.post("/api/layout", json={"printer_id": "shop_printer", "kind": "model", "model": "wall.stl"})
+    assert layout.status_code == 200
+    body = layout.json()
+    assert body["items"][0]["min_x"] == 10
+    assert body["items"][0]["rotation"] == [0, 0, 90]
+
+    groups = client.put(
+        "/api/groups",
+        json={"groups": [{"name": "plate", "files": ["wall.stl"]}]},
+    )
+    group_id = groups.json()["groups"][0]["id"]
+    moved = client.put(
+        "/api/groups/layout",
+        json={"id": group_id, "printer_id": "shop_printer", "file": "wall.stl", "x": 40, "y": 15},
+    )
+    assert moved.status_code == 200
+    assert moved.json()["items"][0]["min_x"] == 40
+
+    bundle = client.get("/api/bundles", params={"printer_id": "shop_printer"})
+    assert bundle.status_code == 200
+    empty = tmp_path / "fresh"
+    fresh = TestClient(
+        create_app(
+            DataPaths(
+                input_dir=tmp_path / "input",
+                output_dir=tmp_path / "output",
+                cura_config_dir=empty,
+                app_dir=tmp_path / "app-fresh",
+                frontend_dir=tmp_path / "frontend",
+                cura_root=None,
+            )
+        )
+    )
+    uploaded = fresh.post("/api/bundles", files={"file": ("printer.zip", bundle.content, "application/zip")})
+    assert uploaded.status_code == 200
+    assert uploaded.json()["imported"] == ["shop_printer"]
+    assert any(printer["id"] == "shop_printer" for printer in fresh.get("/api/printers").json())

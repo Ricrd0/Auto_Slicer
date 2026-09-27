@@ -1,0 +1,16 @@
+services:
+  auto-slicer:
+    build:
+      context: .
+      args:
+        CURA_VERSION: "5.13.0"
+    ports:
+      - "8080:8080"
+    environment:
+      AUTO_SLICER_CURA_FALLBACK: /host-cura
+    volumes:
+      - ./data/input:/data/input
+      - ./data/output:/data/output
+      - ./data/cura-config:/data/cura-config
+      - ./data/app:/data/app
+      - ${APPDATA:-.}/cura:/host-cura:ro

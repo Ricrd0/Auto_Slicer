@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Auto Slicer</title>
+  <link rel="stylesheet" href="/style.css?v=2">
+  <script type="importmap">
+    { "imports": { "three": "/vendor/three.module.js" } }
+  </script>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Auto Slicer</h1>
+      <p id="engine-status">Checking CuraEngine…</p>
+    </div>
+    <nav>
+      <button type="button" class="active" data-tab="settings">Settings</button>
+      <button type="button" data-tab="printers">Printers</button>
+      <button type="button" data-tab="models">Models</button>
+      <button type="button" data-tab="jobs">Jobs</button>
+    </nav>
+  </header>
+  <main>
+    <section id="settings" class="panel active">
+      <h2>Shared slice settings</h2>
+      <form id="settings-form" class="grid"></form>
+    </section>
+    <section id="printers" class="panel">
+      <h2>Printers</h2>
+      <div class="toolbar">
+        <button type="button" id="refresh-printers">Refresh</button>
+        <a id="download-all" href="/api/bundles">Download all</a>
+        <label class="file-button">Upload bundle<input id="upload-bundle" type="file" accept=".zip"></label>
+      </div>
+      <p id="printer-notice" class="muted"></p>
+      <table>
+        <thead>
+          <tr><th>Use</th><th>Name</th><th>Bed</th><th>Notes</th><th></th></tr>
+        </thead>
+        <tbody id="printer-rows"></tbody>
+      </table>
+    </section>
+    <section id="models" class="panel">
+      <h2>Models and plates</h2>
+      <div class="split">
+        <div>
+          <div class="toolbar">
+            <button type="button" id="refresh-models">Refresh files</button>
+          </div>
+          <div id="model-list" class="list"></div>
+          <div class="toolbar">
+            <input id="group-name" placeholder="Group name">
+            <button type="button" id="add-group">Add group</button>
+          </div>
+          <div id="group-list"></div>
+        </div>
+        <div>
+          <div class="toolbar">
+            <label>Preview printer<select id="preview-printer"></select></label>
+            <label>View<select id="preview-kind"><option value="model">Selected part</option><option value="group">Group</option></select></label>
+            <label>Group<select id="preview-group"></select></label>
+          </div>
+          <div class="toolbar">
+            <button type="button" id="mode-orbit" class="primary">Orbit</button>
+            <button type="button" id="mode-move">Move on bed</button>
+            <button type="button" id="mode-rotate">Rotate</button>
+            <label>Axis<select id="rotate-axis"><option>X</option><option>Y</option><option selected>Z</option></select></label>
+            <button type="button" id="reset-pose">Reset part pose</button>
+            <button type="button" id="reset-layout">Reset group layout</button>
+            <button type="button" id="test-slice" class="primary">Test</button>
+          </div>
+          <p class="notice" id="layout-error"></p>
+          <canvas id="preview"></canvas>
+          <div class="grid" id="pose-fields"></div>
+        </div>
+      </div>
+    </section>
+    <section id="jobs" class="panel">
+      <h2>Slice and results</h2>
+      <div class="toolbar">
+        <button type="button" id="start-batch" class="primary">Slice all printers</button>
+        <span id="job-status" class="muted"></span>
+      </div>
+      <table>
+        <thead>
+          <tr><th>Printer</th><th>Item</th><th>Status</th><th>Time</th><th>Filament</th><th></th></tr>
+        </thead>
+        <tbody id="job-rows"></tbody>
+      </table>
+      <h2>Test gcode</h2>
+      <div class="toolbar">
+        <label>Layer <input id="layer-slider" type="range" min="0" max="0" value="0"></label>
+        <span id="layer-label">0</span>
+        <label class="inline"><input id="show-travel" type="checkbox"> Show travel</label>
+      </div>
+      <canvas id="gcode-view"></canvas>
+    </section>
+  </main>
+  <script type="module" src="/app.js?v=2"></script>
+</body>
+</html>
