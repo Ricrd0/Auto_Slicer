@@ -4,8 +4,10 @@ import threading
 import time
 from typing import Any
 
+from auto_slicer.browse import gcode_root, model_root
 from auto_slicer.cura_config import PrinterProfile, discover_printers
 from auto_slicer.engine import EngineError, locate_cura
+from auto_slicer.orca_config import active_orca_dir, discover_orca_printers
 from auto_slicer.paths import safe_segment
 from auto_slicer.slicing import (
     layout_for_group,
@@ -25,16 +27,21 @@ class JobRunner:
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._printer_lock = threading.Lock()
-        self._printer_cache: tuple[float, list[PrinterProfile]] | None = None
+        self._printer_cache: dict[str, tuple[float, list[PrinterProfile]]] = {}
 
     def printers(self) -> list[PrinterProfile]:
+        engine_name = self.store.load_settings().slicer_engine
         with self._printer_lock:
             now = time.monotonic()
-            if self._printer_cache is not None and now - self._printer_cache[0] < 5:
-                return self._printer_cache[1]
-            _engine, resources, _libs = locate_cura(self.store.paths)
-            found = discover_printers(self.store.paths.cura_config_dir, resources)
-            self._printer_cache = (now, found)
+            cached = self._printer_cache.get(engine_name)
+            if cached is not None and now - cached[0] < 5:
+                return cached[1]
+            if engine_name == "orca":
+                found = discover_orca_printers(active_orca_dir())
+            else:
+                _engine, resources, _libs = locate_cura(self.store.paths)
+                found = discover_printers(self.store.paths.cura_config_dir, resources)
+            self._printer_cache[engine_name] = (now, found)
             return found
 
     def start_batch(self) -> dict[str, Any]:
@@ -65,7 +72,11 @@ class JobRunner:
             printers = [printer for printer in self.printers() if self._included(printer, printer_id)]
             if not printers:
                 raise ValueError("no enabled printer is available")
-            models = list_models(self.store.paths.input_dir)
+            models = list_models(model_root(self.store))
+            included = self.store.load_locations().get("included")
+            if included is not None and selection is None:
+                chosen = {str(item) for item in included}
+                models = [model for model in models if str(model["path"]) in chosen]
             groups = [group for group in self.store.load_groups() if group.get("files")]
             if selection is not None:
                 item_type, item_name = selection
@@ -130,7 +141,7 @@ class JobRunner:
             try:
                 if item_type == "model":
                     layout = layout_for_model(
-                        self.store.paths.input_dir,
+                        model_root(self.store),
                         item_key,
                         printer,
                         settings,
@@ -139,15 +150,15 @@ class JobRunner:
                 else:
                     group = groups[item_key]
                     layout = layout_for_group(
-                        self.store.paths.input_dir,
+                        model_root(self.store),
                         list(group["files"]),
                         printer,
                         settings,
                         poses,
                         group.get("manual_layout"),
                     )
-                prepared = prepare_slice(self.store.paths.input_dir, printer, layout)
-                output = self.store.paths.output_dir / output_rel
+                prepared = prepare_slice(model_root(self.store), printer, layout, settings)
+                output = gcode_root(self.store) / output_rel
 
                 def progress(line: str, current: int = item_id) -> None:
                     self.store.update_item(current, progress=line)

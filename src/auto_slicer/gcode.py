@@ -6,9 +6,15 @@ from pathlib import Path
 
 
 _TIME_RE = re.compile(r"^;TIME:(\d+)", re.MULTILINE)
+_ORCA_TIME_RE = re.compile(
+    r";\s*(?:estimated printing time \(normal mode\)|model printing time)\s*=\s*"
+    r"(?:(\d+)\s*h\s*)?(?:(\d+)\s*m\s*)?(?:(\d+)\s*s)?",
+    re.IGNORECASE,
+)
 _FILAMENT_RE = re.compile(r"^;Filament used:\s*([0-9.]+)", re.MULTILINE)
+_ORCA_FILAMENT_MM_RE = re.compile(r";\s*filament used \[mm\]\s*=\s*([0-9.]+)", re.IGNORECASE)
 _LAYER_COUNT_RE = re.compile(r"^;LAYER_COUNT:(\d+)", re.MULTILINE)
-_LAYER_RE = re.compile(r"^;LAYER:(-?\d+)\s*$")
+_LAYER_RE = re.compile(r"^;(?:LAYER:(-?\d+)|LAYER_CHANGE)\s*$", re.IGNORECASE)
 _MOVE_RE = re.compile(r"^(G0|G1|G00|G01)\b(.*)$", re.IGNORECASE)
 _AXIS_RE = re.compile(r"([XYZE])(-?[0-9]*\.?[0-9]+)", re.IGNORECASE)
 
@@ -28,9 +34,23 @@ class Polyline:
 
 def parse_gcode_header(text: str) -> tuple[int | None, float | None]:
     time_match = _TIME_RE.search(text)
+    if time_match:
+        seconds: int | None = int(time_match.group(1))
+    else:
+        orca_time = _ORCA_TIME_RE.search(text)
+        if orca_time and any(orca_time.groups()):
+            hours = int(orca_time.group(1) or 0)
+            minutes = int(orca_time.group(2) or 0)
+            secs = int(orca_time.group(3) or 0)
+            seconds = hours * 3600 + minutes * 60 + secs
+        else:
+            seconds = None
     filament_match = _FILAMENT_RE.search(text)
-    seconds = int(time_match.group(1)) if time_match else None
-    filament = float(filament_match.group(1)) if filament_match else None
+    if filament_match:
+        filament: float | None = float(filament_match.group(1))
+    else:
+        orca_filament = _ORCA_FILAMENT_MM_RE.search(text)
+        filament = float(orca_filament.group(1)) / 1000.0 if orca_filament else None
     return seconds, filament
 
 

@@ -105,3 +105,33 @@ canvas {
 .file-button input { display: none; }
 
 .group-block { display: flex; flex-direction: column; gap: 0.25rem; margin: 0.75rem 0; }
+
+.path-stack { display: flex; flex-direction: column; gap: 0.65rem; margin-bottom: 0.4rem; }
+.path-field { display: flex; gap: 0.4rem; align-items: center; }
+.path-field input { flex: 1; min-width: 0; }
+
+dialog {
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  width: min(720px, 94vw);
+  padding: 1rem;
+}
+dialog::backdrop { background: rgb(0 0 0 / 55%); }
+dialog h2 { margin: 0; }
+
+.browser-row, .model-row {
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+  border-bottom: 1px solid var(--line);
+}
+.browser-row button, .model-row button {
+  flex: 1;
+  text-align: left;
+  border: 0;
+  background: transparent;
+  color: inherit;
+}
+.browser-spacer { width: 1rem; flex: 0 0 1rem; }

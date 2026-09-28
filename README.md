@@ -1,12 +1,16 @@
 # Auto Slicer
 
-Batch-slice every STL and 3MF in an input folder with CuraEngine, once per printer, and write gcode under a shared folder name on each machine.
+Batch-slice every STL and 3MF in an input folder, once per printer, and write gcode under a shared folder name on each machine.
 
-The web app calls CuraEngine directly. No language model is involved.
+Settings has a slicing engine choice. Cura uses CuraEngine 5.13 and the Cura machine profiles. Orca uses OrcaSlicer 2.4.2 and the machine profiles under `%APPDATA%\OrcaSlicer`. The same layer height, ironing, seam, infill, combing, adhesion, and support settings are applied to whichever engine is selected.
+
+The web app calls the slicer directly. No language model is involved.
 
 ## Run
 
-Put models in `data/input`. On Windows the app reads `%APPDATA%\cura\5.13` when `data/cura-config` is empty, and Docker mounts that folder read-only. To use a copy instead, put the version folder (the one that contains `machine_instances`) in `data/cura-config`.
+On Windows the app reads `%APPDATA%\cura\5.13` when `data/cura-config` is empty, and Docker mounts that folder read-only. To use a copy instead, put the version folder (the one that contains `machine_instances`) in `data/cura-config`. Orca profiles are read from `%APPDATA%\OrcaSlicer`, which Docker mounts at `/host-orca`.
+
+The Models tab has Browse buttons for the input folder and the output directory. Docker can see the drives mounted in `docker-compose.yml`. The output folder name in Settings is the shared subfolder written under each printer.
 
 ```bash
 docker compose build

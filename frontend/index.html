@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Auto Slicer</title>
-  <link rel="stylesheet" href="/style.css?v=2">
+  <link rel="stylesheet" href="/style.css?v=4">
   <script type="importmap">
     { "imports": { "three": "/vendor/three.module.js" } }
   </script>
@@ -44,6 +44,21 @@
     </section>
     <section id="models" class="panel">
       <h2>Models and plates</h2>
+      <div class="path-stack">
+        <label>Input folder
+          <span class="path-field">
+            <input id="input-path" spellcheck="false" placeholder="Folder of STL and 3MF files">
+            <button type="button" id="browse-input">Browse</button>
+          </span>
+        </label>
+        <label>Output directory
+          <span class="path-field">
+            <input id="output-path" spellcheck="false" placeholder="Where gcode files are written">
+            <button type="button" id="browse-output">Browse</button>
+          </span>
+        </label>
+      </div>
+      <p id="path-error" class="notice"></p>
       <div class="split">
         <div>
           <div class="toolbar">
@@ -98,6 +113,23 @@
       <canvas id="gcode-view"></canvas>
     </section>
   </main>
-  <script type="module" src="/app.js?v=2"></script>
+  <dialog id="browser">
+    <div class="toolbar">
+      <h2 id="browser-title">Choose folder</h2>
+      <button type="button" id="browser-close">Close</button>
+    </div>
+    <div class="path-field">
+      <button type="button" id="browser-up">Up</button>
+      <input id="browser-path" spellcheck="false">
+      <button type="button" id="browser-go">Go</button>
+    </div>
+    <p id="browser-error" class="notice"></p>
+    <div id="browser-list" class="list"></div>
+    <div class="toolbar">
+      <button type="button" id="browser-use" class="primary">Use this folder</button>
+      <button type="button" id="browser-files">Slice selected files</button>
+    </div>
+  </dialog>
+  <script type="module" src="/app.js?v=4"></script>
 </body>
 </html>

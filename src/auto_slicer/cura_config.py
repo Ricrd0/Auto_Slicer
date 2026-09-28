@@ -57,6 +57,7 @@ class PrinterProfile:
     resource_setting_version: int | None
     warnings: list[str] = field(default_factory=list)
     error: str | None = None
+    engine: str = "cura"
     source_files: list[str] = field(default_factory=list)
     global_cfg: str | None = None
     config_root: str = ""
@@ -82,6 +83,7 @@ class PrinterProfile:
             )
         return {
             "id": self.id,
+            "engine": self.engine,
             "name": self.name,
             "definition_id": self.definition_id,
             "machine_width": self.machine_width,

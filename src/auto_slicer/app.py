@@ -6,9 +6,11 @@ from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+from auto_slicer.browse import browse, gcode_root, model_root, public_locations, update_locations
 from auto_slicer.bundles import export_all, export_printer, import_bundle
 from auto_slicer.cura_config import active_config_dir
 from auto_slicer.engine import locate_cura
+from auto_slicer.orca_config import active_orca_dir, locate_orca
 from auto_slicer.gcode import gcode_info, layer_polylines
 from auto_slicer.jobs import JobRunner
 from auto_slicer.paths import DataPaths, safe_relative, safe_segment
@@ -19,6 +21,7 @@ from auto_slicer.settings_schema import (
     INFILL_PATTERNS,
     SEAM_POSITIONS,
     SEAM_TYPES,
+    SLICER_ENGINES,
     SUPPORT_STRUCTURES,
     SUPPORT_TYPES,
     SliceSettings,
@@ -53,12 +56,18 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
     @app.get("/api/health")
     def health() -> dict[str, object]:
         engine, resources, _libs = locate_cura(store.paths)
+        orca_binary, _orca_libs = locate_orca()
         config_dir = active_config_dir(store.paths.cura_config_dir)
+        orca_dir = active_orca_dir()
         return {
             "ok": True,
             "engine": str(engine) if engine else None,
+            "cura_engine": str(engine) if engine else None,
+            "orca_engine": str(orca_binary) if orca_binary else None,
             "resources": str(resources) if resources else None,
             "config_dir": str(config_dir),
+            "orca_config_dir": str(orca_dir) if orca_dir else None,
+            "slicer_engine": store.load_settings().slicer_engine,
             "printer_count": len(runner.printers()),
         }
 
@@ -72,6 +81,7 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
             "support_types": SUPPORT_TYPES,
             "support_structures": SUPPORT_STRUCTURES,
             "infill_patterns": INFILL_PATTERNS,
+            "slicer_engines": SLICER_ENGINES,
         }
 
     @app.get("/api/settings")
@@ -128,14 +138,37 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"imported": imported}
 
+    @app.get("/api/locations")
+    def get_locations() -> dict[str, object]:
+        return public_locations(store)
+
+    @app.put("/api/locations")
+    def put_locations(payload: dict[str, object]) -> dict[str, object]:
+        try:
+            return update_locations(store, payload)
+        except (TypeError, ValueError, OSError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/browse")
+    def get_browse(path: str = "") -> dict[str, object]:
+        try:
+            return browse(path, [store.paths.input_dir, store.paths.output_dir])
+        except (ValueError, OSError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.get("/api/models")
     def get_models() -> list[dict[str, object]]:
-        return list_models(store.paths.input_dir)
+        models = list_models(model_root(store))
+        included = store.load_locations().get("included")
+        chosen = None if included is None else {str(item) for item in included}
+        for model in models:
+            model["included"] = chosen is None or str(model["path"]) in chosen
+        return models
 
     @app.get("/api/models/mesh")
     def get_mesh(path: str) -> Response:
         try:
-            payload = model_stl_bytes(store.paths.input_dir, path)
+            payload = model_stl_bytes(model_root(store), path)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="model not found") from exc
         except ValueError as exc:
@@ -207,7 +240,7 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
             positions[file_name] = {"x": float(payload["x"]), "y": float(payload["y"])}
         else:
             current = layout_for_group(
-                store.paths.input_dir,
+                model_root(store),
                 list(group["files"]),
                 printer,
                 settings,
@@ -218,7 +251,7 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
         group["manual_layout"] = positions
         store.save_groups(groups)
         layout = layout_for_group(
-            store.paths.input_dir,
+            model_root(store),
             list(group["files"]),
             printer,
             settings,
@@ -246,7 +279,7 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
         try:
             if kind == "model":
                 layout = layout_for_model(
-                    store.paths.input_dir,
+                    model_root(store),
                     str(payload.get("model", "")),
                     printer,
                     settings,
@@ -260,7 +293,7 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
                 if group is None:
                     raise HTTPException(status_code=404, detail="group was not found")
                 layout = layout_for_group(
-                    store.paths.input_dir,
+                    model_root(store),
                     list(group["files"]),
                     printer,
                     settings,
@@ -344,7 +377,7 @@ def _find_printer(runner: JobRunner, printer_id: str):
 
 def _output_file(store: Store, relative: str) -> Path:
     try:
-        path = store.paths.output_dir / safe_relative(relative)
+        path = gcode_root(store) / safe_relative(relative)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not path.is_file():

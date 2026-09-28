@@ -104,22 +104,26 @@ def transform_mesh(
     min_y: float,
     machine_width: float,
     machine_depth: float,
+    origin: str = "bed_center",
 ) -> list[Triangle]:
-    """Rotate, drop onto Z=0, and place the footprint in bed-center coordinates.
+    """Rotate, drop onto Z=0, and place the footprint for the slicer's origin.
 
     Stored positions are millimetres from the front-left of the bed. CuraEngine
     expects mesh coordinates whose origin is the bed center, then adds half the
-    bed size when ``machine_center_is_zero`` is false. Writing center-origin
-    coordinates and leaving that printer setting alone lands the part on the
-    same front-left position for both kinds of origin.
+    bed size when ``machine_center_is_zero`` is false. Orca's printable area
+    starts at the front-left corner, so those meshes keep that origin.
     """
     rotated = [
         tuple(rotate_xyz(vertex, rotation[0], rotation[1], rotation[2]) for vertex in tri)
         for tri in triangles
     ]
     (low_x, low_y, low_z), _high = bounds(rotated)
-    dx = (min_x - machine_width / 2.0) - low_x
-    dy = (min_y - machine_depth / 2.0) - low_y
+    if origin == "front_left":
+        dx = min_x - low_x
+        dy = min_y - low_y
+    else:
+        dx = (min_x - machine_width / 2.0) - low_x
+        dy = (min_y - machine_depth / 2.0) - low_y
     dz = -low_z
     return [
         tuple((vertex[0] + dx, vertex[1] + dy, vertex[2] + dz) for vertex in tri)

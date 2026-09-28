@@ -83,3 +83,23 @@ def test_settings_pose_layout_and_bundle_upload(tmp_path: Path, monkeypatch: pyt
     assert uploaded.status_code == 200
     assert uploaded.json()["imported"] == ["shop_printer"]
     assert any(printer["id"] == "shop_printer" for printer in fresh.get("/api/printers").json())
+
+
+def test_browse_folder_and_choose_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _client(tmp_path, monkeypatch)
+    folder = tmp_path / "input"
+    (folder / "other.stl").write_bytes((folder / "wall.stl").read_bytes())
+    listed = client.get("/api/browse", params={"path": str(folder)})
+    assert listed.status_code == 200
+    names = {entry["name"] for entry in listed.json()["entries"]}
+    assert "wall.stl" in names
+    assert "other.stl" in names
+
+    saved = client.put("/api/locations", json={"input_dir": str(folder), "included": ["wall.stl"]})
+    assert saved.status_code == 200
+    flags = {model["path"]: model["included"] for model in client.get("/api/models").json()}
+    assert flags["wall.stl"] is True
+    assert flags["other.stl"] is False
+
+    outside = client.get("/api/browse", params={"path": str(tmp_path / "missing")})
+    assert outside.status_code == 400

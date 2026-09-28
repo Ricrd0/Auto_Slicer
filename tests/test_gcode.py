@@ -19,6 +19,22 @@ G1 X5 Y0 E4
 """
 
 
+def test_orca_header_and_layer_changes(tmp_path: Path) -> None:
+    text = """;LAYER_CHANGE
+;Z:0.2
+G1 X0 Y0 E1
+;LAYER_CHANGE
+; estimated printing time (normal mode) = 1h 2m 3s
+; filament used [mm] = 1500
+"""
+    seconds, filament = parse_gcode_header(text)
+    assert seconds == 3723
+    assert filament == 1.5
+    path = tmp_path / "part.gcode"
+    path.write_text(text, encoding="utf-8")
+    assert gcode_info(path).layer_count == 2
+
+
 def test_header_comments() -> None:
     seconds, filament = parse_gcode_header(SAMPLE)
     assert seconds == 120

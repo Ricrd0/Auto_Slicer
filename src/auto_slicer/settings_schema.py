@@ -20,6 +20,7 @@ SeamPosition = Literal[
 CombingMode = Literal["off", "all", "noskin", "infill"]
 SupportType = Literal["buildplate", "everywhere"]
 SupportStructure = Literal["normal", "tree"]
+SlicerEngine = Literal["cura", "orca"]
 
 ADHESION_TYPES: tuple[AdhesionType, ...] = ("none", "skirt", "brim", "raft")
 SEAM_TYPES: tuple[SeamType, ...] = (
@@ -41,6 +42,7 @@ SEAM_POSITIONS: tuple[SeamPosition, ...] = (
 COMBING_MODES: tuple[CombingMode, ...] = ("off", "all", "noskin", "infill")
 SUPPORT_TYPES: tuple[SupportType, ...] = ("buildplate", "everywhere")
 SUPPORT_STRUCTURES: tuple[SupportStructure, ...] = ("normal", "tree")
+SLICER_ENGINES: tuple[SlicerEngine, ...] = ("cura", "orca")
 INFILL_PATTERNS: tuple[str, ...] = (
     "lightning",
     "gyroid",
@@ -68,6 +70,7 @@ def _enum(value: str, allowed: tuple[str, ...], field: str) -> str:
 
 @dataclass
 class SliceSettings:
+    slicer_engine: SlicerEngine = "cura"
     output_folder_name: str = ""
     rotation_x: float = 0.0
     rotation_y: float = 0.0
@@ -101,6 +104,7 @@ class SliceSettings:
         _enum(self.z_seam_position, SEAM_POSITIONS, "z_seam_position")
         _enum(self.retraction_combing, COMBING_MODES, "retraction_combing")
         _enum(self.adhesion_type, ADHESION_TYPES, "adhesion_type")
+        _enum(self.slicer_engine, SLICER_ENGINES, "slicer_engine")
         _enum(self.support_type, SUPPORT_TYPES, "support_type")
         _enum(self.support_structure, SUPPORT_STRUCTURES, "support_structure")
         if self.infill_pattern not in INFILL_PATTERNS:
@@ -167,6 +171,68 @@ def cura_setting_overrides(settings: SliceSettings) -> list[tuple[str, str]]:
                 ("support_infill_rate", _number(settings.support_infill_rate)),
             ]
         )
+    return values
+
+
+_ORCA_INFILL = {
+    "trihexagon": "tri-hexagon",
+    "zigzag": "zig-zag",
+    "cross_3d": "cross",
+}
+_ORCA_SEAM = {
+    "backleft": "back",
+    "back": "back",
+    "backright": "back",
+    "left": "aligned",
+    "right": "aligned",
+    "frontleft": "nearest",
+    "front": "nearest",
+    "frontright": "nearest",
+}
+
+
+def orca_setting_overrides(settings: SliceSettings) -> dict[str, str]:
+    """Shared settings written into an Orca process profile."""
+    settings.validate()
+    if settings.ironing_enabled and settings.ironing_only_highest_layer:
+        ironing = "topmost"
+    elif settings.ironing_enabled:
+        ironing = "top"
+    else:
+        ironing = "no ironing"
+    if settings.z_seam_type == "random":
+        seam = "random"
+    elif settings.z_seam_type == "user_specified":
+        seam = _ORCA_SEAM[settings.z_seam_position]
+    else:
+        seam = "nearest"
+    values = {
+        "layer_height": _number(settings.layer_height),
+        "ironing_type": ironing,
+        "seam_position": seam,
+        "sparse_infill_pattern": _ORCA_INFILL.get(settings.infill_pattern, settings.infill_pattern),
+        "sparse_infill_density": f"{_number(settings.infill_sparse_density)}%",
+        "reduce_crossing_wall": "0" if settings.retraction_combing == "off" else "1",
+        "enable_support": "1" if settings.support_enable else "0",
+        "brim_type": "no_brim",
+        "brim_width": "0",
+        "skirt_loops": "0",
+        "raft_layers": "0",
+    }
+    if settings.adhesion_type == "brim":
+        values["brim_type"] = "outer_only"
+        values["brim_width"] = _number(settings.brim_width)
+    elif settings.adhesion_type == "skirt":
+        values["skirt_loops"] = str(int(settings.skirt_line_count))
+    elif settings.adhesion_type == "raft":
+        values["raft_layers"] = "3"
+        values["raft_first_layer_expansion"] = _number(settings.raft_margin)
+    if settings.support_enable:
+        structure = "tree" if settings.support_structure == "tree" else "normal"
+        values["support_type"] = f"{structure}(auto)"
+        values["support_on_build_plate_only"] = "1" if settings.support_type == "buildplate" else "0"
+        values["support_threshold_angle"] = _number(settings.support_angle)
+        values["support_interface_density"] = f"{_number(settings.support_infill_rate)}%"
     return values
 
 

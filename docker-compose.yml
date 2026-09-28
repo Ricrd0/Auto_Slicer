@@ -4,13 +4,23 @@ services:
       context: .
       args:
         CURA_VERSION: "5.13.0"
+        ORCA_VERSION: "2.4.2"
     ports:
       - "8080:8080"
     environment:
       AUTO_SLICER_CURA_FALLBACK: /host-cura
+      AUTO_SLICER_ORCA_FALLBACK: /host-orca
+      AUTO_SLICER_HOST_MOUNTS: "H:/Projects/Auto_Slicer/data/input=/data/input;H:/Projects/Auto_Slicer/data/output=/data/output;A:/=/host/a;C:/=/host/c;D:/=/host/d;F:/=/host/f;H:/=/host/h;I:/=/host/i"
     volumes:
       - ./data/input:/data/input
       - ./data/output:/data/output
       - ./data/cura-config:/data/cura-config
       - ./data/app:/data/app
       - ${APPDATA:-.}/cura:/host-cura:ro
+      - ${APPDATA:-.}/OrcaSlicer:/host-orca:ro
+      - A:/:/host/a
+      - C:/:/host/c
+      - D:/:/host/d
+      - F:/:/host/f
+      - H:/:/host/h
+      - I:/:/host/i

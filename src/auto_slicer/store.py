@@ -189,6 +189,30 @@ class Store:
                 result.append(_job_dict(row, items))
         return result
 
+    def load_locations(self) -> dict[str, Any]:
+        path = self.paths.app_dir / "locations.json"
+        data: dict[str, Any] = {"input_dir": "", "output_dir": "", "included": None}
+        if not path.is_file():
+            return data
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return data
+        data["input_dir"] = str(raw.get("input_dir") or "")
+        data["output_dir"] = str(raw.get("output_dir") or "")
+        included = raw.get("included")
+        data["included"] = [str(item) for item in included] if isinstance(included, list) else None
+        return data
+
+    def save_locations(self, locations: dict[str, Any]) -> dict[str, Any]:
+        included = locations.get("included")
+        payload = {
+            "input_dir": str(locations.get("input_dir") or ""),
+            "output_dir": str(locations.get("output_dir") or ""),
+            "included": [str(item) for item in included] if isinstance(included, list) else None,
+        }
+        self._write_json(self.paths.app_dir / "locations.json", payload)
+        return payload
+
     def _write_json(self, path: Path, payload: object) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, indent=2), encoding="utf-8")

@@ -23,6 +23,8 @@ const state = {
   settings: null,
   options: null,
   printers: [],
+  locations: { input_dir: "", output_dir: "", included: null },
+  listing: null,
   models: [],
   groups: [],
   poses: {},
@@ -372,7 +374,7 @@ function field(name, label, type, extra = {}) {
     for (const option of extra.options) {
       const node = document.createElement("option");
       node.value = option;
-      node.textContent = option.replaceAll("_", " ");
+      node.textContent = extra.labels?.[option] || option.replaceAll("_", " ");
       input.append(node);
     }
   }
@@ -384,6 +386,7 @@ function renderSettings() {
   const form = $("settings-form");
   const options = state.options;
   const specs = [
+    ["slicer_engine", "Slicing engine", "select", { options: options.slicer_engines, labels: { cura: "Cura", orca: "Orca" } }],
     ["output_folder_name", "Output folder name", "text"],
     ["rotation_x", "Shared rotation X", "number", { step: "1" }],
     ["rotation_y", "Shared rotation Y", "number", { step: "1" }],
@@ -420,6 +423,7 @@ function renderSettings() {
 
 async function saveSettings() {
   const form = $("settings-form");
+  const previousEngine = state.settings.slicer_engine;
   const payload = { ...state.settings };
   for (const input of form.querySelectorAll("input, select")) {
     if (input.type === "checkbox") payload[input.name] = input.checked;
@@ -427,16 +431,23 @@ async function saveSettings() {
     else payload[input.name] = input.value;
   }
   state.settings = await api("/api/settings", { method: "PUT", body: JSON.stringify(payload) });
+  if (state.settings.slicer_engine !== previousEngine) {
+    state.printers = await api("/api/printers");
+    renderPrinters();
+  }
   if ($("models").classList.contains("active")) await showLayout();
 }
 
 function renderPrinters() {
   const notice = $("printer-notice");
-  const root = state.health?.config_dir;
+  const engine = state.settings?.slicer_engine || "cura";
+  const root = engine === "orca" ? state.health?.orca_config_dir : state.health?.config_dir;
   if (!state.printers.length) {
-    notice.textContent = root
-      ? `No printers in ${root}. Cura keeps machine profiles in a version folder such as %APPDATA%\\cura\\5.13 (the folder that contains machine_instances).`
-      : "No printers found.";
+    notice.textContent = engine === "orca"
+      ? `No Orca printers${root ? ` in ${root}` : ""}. Orca keeps machine profiles under %APPDATA%\\OrcaSlicer.`
+      : root
+        ? `No printers in ${root}. Cura keeps machine profiles in a version folder such as %APPDATA%\\cura\\5.13 (the folder that contains machine_instances).`
+        : "No printers found.";
   } else {
     notice.textContent = root ? `Loaded from ${root}` : "";
   }
@@ -468,10 +479,59 @@ function renderPrinters() {
   if ([...select.options].some((option) => option.value === previous)) select.value = previous;
 }
 
+function renderPaths() {
+  const input = $("input-path");
+  const output = $("output-path");
+  if (document.activeElement !== input) input.value = state.locations?.input_dir || "";
+  if (document.activeElement !== output) output.value = state.locations?.output_dir || "";
+}
+
+async function commitPath(field, value) {
+  $("path-error").textContent = "";
+  try {
+    state.locations = await api("/api/locations", {
+      method: "PUT",
+      body: JSON.stringify({ [field]: value }),
+    });
+    renderPaths();
+    if (field === "input_dir") {
+      state.models = await api("/api/models");
+      state.selectedModel = null;
+      renderModels();
+      if ($("models").classList.contains("active")) await showLayout();
+    }
+  } catch (error) {
+    $("path-error").textContent = error.message;
+  }
+}
+
 function renderModels() {
   const list = $("model-list");
   list.innerHTML = "";
+  if (!state.models.length) {
+    const empty = document.createElement("p");
+    empty.className = "muted";
+    empty.textContent = "No STL or 3MF files in this folder. Browse to a folder that contains models, or paste its path above.";
+    list.append(empty);
+  }
   for (const model of state.models) {
+    const row = document.createElement("div");
+    row.className = "model-row";
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = model.included !== false;
+    box.title = "Include this file when slicing";
+    box.addEventListener("change", async () => {
+      const included = state.models
+        .filter((item) => (item.path === model.path ? box.checked : item.included !== false))
+        .map((item) => item.path);
+      state.locations = await api("/api/locations", {
+        method: "PUT",
+        body: JSON.stringify({ included }),
+      });
+      state.models = await api("/api/models");
+      renderModels();
+    });
     const button = document.createElement("button");
     button.type = "button";
     button.textContent = model.path;
@@ -482,7 +542,8 @@ function renderModels() {
       renderModels();
       await showLayout();
     });
-    list.append(button);
+    row.append(box, button);
+    list.append(row);
   }
   const groupSelect = $("preview-group");
   groupSelect.innerHTML = "";
@@ -636,6 +697,101 @@ $("refresh-models").addEventListener("click", async () => {
   renderModels();
   await showLayout();
 });
+$("input-path").addEventListener("change", () => commitPath("input_dir", $("input-path").value));
+$("output-path").addEventListener("change", () => commitPath("output_dir", $("output-path").value));
+$("browse-input").addEventListener("click", () => openBrowser("input"));
+$("browse-output").addEventListener("click", () => openBrowser("output"));
+$("browser-close").addEventListener("click", () => $("browser").close());
+$("browser-up").addEventListener("click", () => loadBrowser(state.listing?.parent || ""));
+$("browser-go").addEventListener("click", () => loadBrowser($("browser-path").value));
+$("browser-path").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    loadBrowser($("browser-path").value);
+  }
+});
+$("browser-use").addEventListener("click", () => applyBrowser(false));
+$("browser-files").addEventListener("click", () => applyBrowser(true));
+
+async function openBrowser(purpose) {
+  state.browserPurpose = purpose;
+  $("browser-title").textContent = purpose === "input" ? "Choose input folder" : "Choose output directory";
+  $("browser-files").hidden = purpose !== "input";
+  $("browser-error").textContent = "";
+  $("browser").showModal();
+  const start = purpose === "input" ? $("input-path").value : $("output-path").value;
+  await loadBrowser(start);
+}
+
+async function loadBrowser(path) {
+  $("browser-error").textContent = "";
+  try {
+    const listing = await api(`/api/browse?path=${encodeURIComponent(path || "")}`);
+    state.listing = listing;
+    $("browser-path").value = listing.path || "";
+    const list = $("browser-list");
+    list.innerHTML = "";
+    if (!listing.entries.length) {
+      const empty = document.createElement("p");
+      empty.className = "muted";
+      empty.textContent = path ? "This folder has no subfolders or model files." : "No drives are visible.";
+      list.append(empty);
+      return;
+    }
+    for (const entry of listing.entries) {
+      const row = document.createElement("div");
+      row.className = "browser-row";
+      if (entry.kind === "file" && state.browserPurpose === "input") {
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        box.dataset.file = entry.name;
+        row.append(box);
+      } else {
+        const spacer = document.createElement("span");
+        spacer.className = "browser-spacer";
+        row.append(spacer);
+      }
+      const button = document.createElement("button");
+      button.type = "button";
+      const folder = entry.kind === "dir" && !entry.name.endsWith("\\") ? `${entry.name}\\` : entry.name;
+      button.textContent = folder;
+      if (entry.kind === "dir") button.addEventListener("click", () => loadBrowser(entry.path));
+      row.append(button);
+      list.append(row);
+    }
+  } catch (error) {
+    $("browser-error").textContent = error.message;
+  }
+}
+
+async function applyBrowser(filesOnly) {
+  const path = $("browser-path").value;
+  const field = state.browserPurpose === "output" ? "output_dir" : "input_dir";
+  const body = { [field]: path };
+  if (field === "input_dir") {
+    body.included = filesOnly
+      ? [...$("browser-list").querySelectorAll("input:checked")].map((box) => box.dataset.file)
+      : null;
+    if (filesOnly && !body.included.length) {
+      $("browser-error").textContent = "Select one or more STL or 3MF files.";
+      return;
+    }
+  }
+  try {
+    state.locations = await api("/api/locations", { method: "PUT", body: JSON.stringify(body) });
+    $("browser").close();
+    renderPaths();
+    $("path-error").textContent = "";
+    if (field === "input_dir") {
+      state.models = await api("/api/models");
+      state.selectedModel = state.models[0]?.path || null;
+      renderModels();
+      if ($("models").classList.contains("active")) await showLayout();
+    }
+  } catch (error) {
+    $("browser-error").textContent = error.message;
+  }
+}
 $("add-group").addEventListener("click", async () => {
   const name = $("group-name").value.trim() || `group ${state.groups.length + 1}`;
   state.groups.push({ name, files: state.selectedModel ? [state.selectedModel] : [] });
@@ -710,21 +866,25 @@ const boot = await Promise.all([
   api("/api/settings"),
   api("/api/printers"),
   api("/api/models"),
+  api("/api/locations"),
   api("/api/groups"),
   api("/api/poses"),
   api("/api/jobs/current"),
 ]);
-$("engine-status").textContent = boot[0].engine ? `CuraEngine ready` : "CuraEngine was not found in this container";
+const curaReady = boot[0].cura_engine || boot[0].engine;
+$("engine-status").textContent = `${curaReady ? "CuraEngine ready" : "CuraEngine was not found"} · ${boot[0].orca_engine ? "OrcaSlicer ready" : "OrcaSlicer was not found"}`;
 state.health = boot[0];
 state.options = boot[1];
 state.settings = boot[2];
 state.printers = boot[3];
 state.models = boot[4];
-state.groups = boot[5].groups;
-state.poses = boot[6];
+state.locations = boot[5];
+state.groups = boot[6].groups;
+state.poses = boot[7];
 renderSettings();
 renderPrinters();
+renderPaths();
 renderModels();
-renderJob(boot[7]);
+renderJob(boot[8]);
 await showLayout();
-if (boot[7].status === "running" || boot[7].status === "queued") pollJob();
+if (boot[8].status === "running" || boot[8].status === "queued") pollJob();

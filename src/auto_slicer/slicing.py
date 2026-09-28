@@ -9,6 +9,17 @@ from auto_slicer.cura_config import PrinterProfile, active_config_dir
 from auto_slicer.engine import EngineError, build_slice_command, locate_cura, run_slice
 from auto_slicer.gcode import parse_gcode_header
 from auto_slicer.meshio import load_model, transform_mesh, write_stl
+from auto_slicer.orca_config import (
+    active_orca_dir,
+    build_orca_command,
+    extract_plate_gcode,
+    generic_pla,
+    locate_orca,
+    orca_origin,
+    write_assemble_list,
+    write_filament_profile,
+    write_process_profile,
+)
 from auto_slicer.paths import DataPaths, safe_relative, safe_segment
 from auto_slicer.placement import Footprint, Layout, footprint_of, place_group, place_single
 from auto_slicer.settings_schema import SliceSettings, pack_gap
@@ -114,6 +125,7 @@ def prepare_slice(
     input_dir: Path,
     printer: PrinterProfile,
     layout: Layout,
+    settings: SliceSettings,
 ) -> PreparedSlice:
     if layout.error:
         raise ValueError(layout.error)
@@ -132,6 +144,7 @@ def prepare_slice(
             item.min_y,
             printer.machine_width,
             printer.machine_depth,
+            orca_origin(settings),
         )
         destination = root / f"{len(meshes)}.stl"
         destination.write_bytes(write_stl(posed))
@@ -164,6 +177,8 @@ def run_prepared_slice(
     output: Path,
     on_progress: Any = None,
 ) -> tuple[int | None, float | None]:
+    if settings.slicer_engine == "orca":
+        return _run_orca(printer, settings, prepared, output, on_progress)
     engine, resources, library_path = locate_cura(paths)
     if engine is None or resources is None:
         raise EngineError("CuraEngine was not found. Build the Docker image or set CURA_ENGINE and CURA_RESOURCES.")
@@ -182,8 +197,55 @@ def run_prepared_slice(
         if output.is_file():
             output.unlink()
         raise EngineError(tail or f"CuraEngine exited with status {code}")
-    header = output.read_text(encoding="utf-8", errors="replace")[:8000]
-    return parse_gcode_header(header)
+    return _header_from_file(output)
+
+
+def _run_orca(
+    printer: PrinterProfile,
+    settings: SliceSettings,
+    prepared: PreparedSlice,
+    output: Path,
+    on_progress: Any,
+) -> tuple[int | None, float | None]:
+    binary, library_path = locate_orca()
+    if binary is None:
+        raise EngineError("OrcaSlicer was not found. Build the Docker image or set ORCA_SLICER.")
+    config_dir = active_orca_dir()
+    if config_dir is None:
+        raise EngineError("Orca configuration was not found. Mount %APPDATA%\\OrcaSlicer or set ORCA_CONFIG.")
+    root = Path(prepared.temp_dir.name)
+    process_path = root / "process.json"
+    assemble_path = root / "assemble.json"
+    write_process_profile(process_path, settings)
+    write_assemble_list(assemble_path, prepared.meshes)
+    filament = generic_pla(config_dir)
+    if filament is None:
+        filament = root / "filament.json"
+        write_filament_profile(filament)
+    archive = root / "plate.3mf"
+    command = build_orca_command(
+        binary,
+        printer,
+        prepared.meshes,
+        archive,
+        config_dir,
+        process_path,
+        filament,
+        assemble_path,
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    code, tail = run_slice(command, library_path, on_progress)
+    if code != 0 or not archive.is_file() or archive.stat().st_size == 0:
+        raise EngineError(tail or f"OrcaSlicer exited with status {code}")
+    extract_plate_gcode(archive, output)
+    if not output.is_file() or output.stat().st_size == 0:
+        raise EngineError(tail or "OrcaSlicer did not produce gcode")
+    return _header_from_file(output)
+
+
+def _header_from_file(path: Path) -> tuple[int | None, float | None]:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    return parse_gcode_header(text[:8000] + "\n" + text[-8000:])
 
 
 def _footprint(input_dir: Path, relative: str, rotation: tuple[float, float, float]) -> Footprint:
