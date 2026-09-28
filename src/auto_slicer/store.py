@@ -203,6 +203,43 @@ class Store:
         data["included"] = [str(item) for item in included] if isinstance(included, list) else None
         return data
 
+    def load_owned(self) -> list[dict[str, Any]]:
+        path = self.paths.app_dir / "owned_printers.json"
+        if not path.is_file():
+            return []
+        data = json.loads(path.read_text(encoding="utf-8"))
+        printers = data.get("printers", []) if isinstance(data, dict) else []
+        return printers if isinstance(printers, list) else []
+
+    def save_owned(self, printers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        self._write_json(self.paths.app_dir / "owned_printers.json", {"printers": printers})
+        return printers
+
+    def load_filaments(self) -> dict[str, Any]:
+        path = self.paths.app_dir / "filaments.json"
+        empty: dict[str, Any] = {"selected_id": None, "filaments": []}
+        if not path.is_file():
+            return empty
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return empty
+        filaments = data.get("filaments", [])
+        selected = data.get("selected_id")
+        return {
+            "selected_id": str(selected) if selected else None,
+            "filaments": filaments if isinstance(filaments, list) else [],
+        }
+
+    def save_filaments(self, library: dict[str, Any]) -> dict[str, Any]:
+        filaments = library.get("filaments", [])
+        selected = library.get("selected_id")
+        payload = {
+            "selected_id": str(selected) if selected else None,
+            "filaments": filaments if isinstance(filaments, list) else [],
+        }
+        self._write_json(self.paths.app_dir / "filaments.json", payload)
+        return payload
+
     def save_locations(self, locations: dict[str, Any]) -> dict[str, Any]:
         included = locations.get("included")
         payload = {

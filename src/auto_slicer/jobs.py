@@ -7,7 +7,15 @@ from typing import Any
 from auto_slicer.browse import gcode_root, model_root
 from auto_slicer.cura_config import PrinterProfile, discover_printers
 from auto_slicer.engine import EngineError, locate_cura
-from auto_slicer.orca_config import active_orca_dir, discover_orca_printers
+from auto_slicer.machine_sync import (
+    apply_filament,
+    filter_owned_orca,
+    machine_for_engine,
+    merge_owned,
+    owned_for_printer,
+    with_synced_bed,
+)
+from auto_slicer.orca_config import active_orca_dir, discover_filaments, discover_orca_printers
 from auto_slicer.paths import safe_segment
 from auto_slicer.slicing import (
     layout_for_group,
@@ -28,9 +36,23 @@ class JobRunner:
         self._lock = threading.Lock()
         self._printer_lock = threading.Lock()
         self._printer_cache: dict[str, tuple[float, list[PrinterProfile]]] = {}
+        self._filament_cache: tuple[float, list[dict[str, Any]]] | None = None
 
-    def printers(self) -> list[PrinterProfile]:
+    def printers(self, *, catalog: bool = False) -> list[PrinterProfile]:
         engine_name = self.store.load_settings().slicer_engine
+        found = self._discovered(engine_name)
+        if engine_name == "orca" and not catalog:
+            return filter_owned_orca(found, self.ensure_owned())
+        return found
+
+    def ensure_owned(self) -> list[dict[str, Any]]:
+        existing = self.store.load_owned()
+        merged = merge_owned(existing, self._discovered("cura"), self._discovered("orca"))
+        if merged != existing:
+            self.store.save_owned(merged)
+        return merged
+
+    def _discovered(self, engine_name: str) -> list[PrinterProfile]:
         with self._printer_lock:
             now = time.monotonic()
             cached = self._printer_cache.get(engine_name)
@@ -42,6 +64,15 @@ class JobRunner:
                 _engine, resources, _libs = locate_cura(self.store.paths)
                 found = discover_printers(self.store.paths.cura_config_dir, resources)
             self._printer_cache[engine_name] = (now, found)
+            return found
+
+    def filament_catalog(self) -> list[dict[str, Any]]:
+        with self._printer_lock:
+            now = time.monotonic()
+            if self._filament_cache is not None and now - self._filament_cache[0] < 30:
+                return self._filament_cache[1]
+            found = discover_filaments(active_orca_dir())
+            self._filament_cache = (now, found)
             return found
 
     def start_batch(self) -> dict[str, Any]:
@@ -132,6 +163,8 @@ class JobRunner:
 
     def _run(self, job_id: str, work: list[tuple[int, PrinterProfile, str, str, str]]) -> None:
         settings = self.store.load_settings()
+        owned = self.store.load_owned()
+        shared_filament = _selected_filament(self.store.load_filaments())
         poses = self.store.load_poses()
         groups = {str(group["id"]): group for group in self.store.load_groups()}
         failures = 0
@@ -139,6 +172,11 @@ class JobRunner:
             self.store.update_item(item_id, status="running", progress="starting")
             prepared = None
             try:
+                record = owned_for_printer(printer, owned)
+                machine = machine_for_engine(record, printer.engine) if record else None
+                if machine is not None:
+                    printer = with_synced_bed(printer, machine)
+                    machine = apply_filament(machine, shared_filament)
                 if item_type == "model":
                     layout = layout_for_model(
                         model_root(self.store),
@@ -164,7 +202,13 @@ class JobRunner:
                     self.store.update_item(current, progress=line)
 
                 seconds, filament = run_prepared_slice(
-                    self.store.paths, printer, settings, prepared, output, progress
+                    self.store.paths,
+                    printer,
+                    settings,
+                    prepared,
+                    output,
+                    progress,
+                    machine if isinstance(machine, dict) else None,
                 )
                 self.store.update_item(
                     item_id,
@@ -182,6 +226,14 @@ class JobRunner:
                     prepared.temp_dir.cleanup()
         status = "completed" if failures == 0 else "completed_with_errors"
         self.store.update_job(job_id, status, finished=True)
+
+
+def _selected_filament(library: dict[str, Any]) -> dict[str, Any] | None:
+    selected = library.get("selected_id")
+    filaments = library.get("filaments")
+    if not selected or not isinstance(filaments, list):
+        return None
+    return next((item for item in filaments if isinstance(item, dict) and item.get("id") == selected), None)
 
 
 def _group_labels(groups: list[dict[str, Any]]) -> dict[str, str]:

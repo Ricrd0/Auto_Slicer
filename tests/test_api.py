@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -44,13 +45,18 @@ def test_settings_pose_layout_and_bundle_upload(tmp_path: Path, monkeypatch: pyt
     assert shop["version_mismatch"] is True
     assert shop["machine_width"] == 220
 
-    pose = client.put("/api/poses", json={"path": "wall.stl", "position": [10, 12], "rotation": [0, 0, 90]})
+    pose = client.put(
+        "/api/poses",
+        json={"path": "wall.stl", "position": [10, 12], "rotation": [0, 0, 90], "z": 4, "scale": 2},
+    )
     assert pose.status_code == 200
     layout = client.post("/api/layout", json={"printer_id": "shop_printer", "kind": "model", "model": "wall.stl"})
     assert layout.status_code == 200
     body = layout.json()
     assert body["items"][0]["min_x"] == 10
     assert body["items"][0]["rotation"] == [0, 0, 90]
+    assert body["items"][0]["z"] == 4
+    assert body["items"][0]["scale"] == 2
 
     groups = client.put(
         "/api/groups",
@@ -103,3 +109,54 @@ def test_browse_folder_and_choose_files(tmp_path: Path, monkeypatch: pytest.Monk
 
     outside = client.get("/api/browse", params={"path": str(tmp_path / "missing")})
     assert outside.status_code == 400
+
+
+def test_orca_filament_can_be_curated_and_selected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _client(tmp_path, monkeypatch)
+    root = tmp_path / "orca"
+    machine = root / "system" / "Creality" / "machine"
+    machine.mkdir(parents=True)
+    (machine / "Ender.json").write_text(
+        json.dumps(
+            {
+                "type": "machine",
+                "name": "Ender",
+                "instantiation": "true",
+                "nozzle_diameter": ["0.4"],
+                "printable_area": ["0x0", "220x0", "220x220", "0x220"],
+                "printable_height": "250",
+            }
+        ),
+        encoding="utf-8",
+    )
+    filament = root / "system" / "Creality" / "filament"
+    filament.mkdir()
+    (filament / "pla.json").write_text(
+        json.dumps(
+            {
+                "type": "filament",
+                "name": "Generic PLA",
+                "instantiation": "true",
+                "nozzle_temperature": ["220"],
+                "nozzle_temperature_initial_layer": ["225"],
+                "hot_plate_temp": ["60"],
+                "hot_plate_temp_initial_layer": ["65"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AUTO_SLICER_ORCA_FALLBACK", str(root))
+    catalog = client.get("/api/filaments/catalog", params={"q": "pla"})
+    assert catalog.status_code == 200
+    assert catalog.json()[0]["name"] == "Generic PLA"
+    added = client.post("/api/filaments", json={"orca_id": "orca-filament:Generic PLA"})
+    assert added.status_code == 200
+    assert added.json()["nozzle_temperature_initial"] == 225
+    library = client.get("/api/filaments").json()
+    assert library["selected_id"] == added.json()["id"]
+    updated = client.put(
+        "/api/filaments",
+        json={**added.json(), "bed_temperature_initial": 70},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["bed_temperature_initial"] == 70

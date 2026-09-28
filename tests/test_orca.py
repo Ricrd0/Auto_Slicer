@@ -6,8 +6,10 @@ from auto_slicer.cura_config import PrinterProfile
 from auto_slicer.meshio import transform_mesh
 from auto_slicer.orca_config import (
     build_orca_command,
+    discover_filaments,
     discover_orca_printers,
     extract_plate_gcode,
+    search_filaments,
 )
 from auto_slicer.settings_schema import SliceSettings, orca_setting_overrides
 
@@ -48,6 +50,100 @@ def test_orca_discovery_keeps_single_extruder_machines(tmp_path: Path) -> None:
     assert not printers["Twin"].slicable
 
 
+def test_filament_temperatures_follow_the_inherited_bed_type(tmp_path: Path) -> None:
+    folder = tmp_path / "system" / "Creality" / "filament"
+    folder.mkdir(parents=True)
+    (folder / "base.json").write_text(
+        json.dumps(
+            {
+                "type": "filament",
+                "name": "fdm_filament_pla",
+                "instantiation": "false",
+                "bed_type": ["Cool Plate"],
+                "cool_plate_temp": ["35"],
+                "cool_plate_temp_initial_layer": ["40"],
+                "hot_plate_temp": ["60"],
+                "nozzle_temperature": ["200"],
+                "nozzle_temperature_initial_layer": ["200"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (folder / "pla.json").write_text(
+        json.dumps(
+            {
+                "type": "filament",
+                "name": "Generic PLA",
+                "instantiation": "true",
+                "inherits": "fdm_filament_pla",
+                "nozzle_temperature": ["220"],
+                "hot_plate_temp": ["55"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    found = {item["name"]: item for item in discover_filaments(tmp_path)}
+    assert set(found) == {"Generic PLA"}
+    pla = found["Generic PLA"]
+    assert pla["nozzle_temperature"] == 220
+    assert pla["nozzle_temperature_initial"] == 200
+    assert pla["bed_plate"] == "Cool Plate"
+    assert pla["bed_temperature"] == 35
+    assert pla["bed_temperature_initial"] == 40
+    assert pla["vendor"] == "Creality"
+
+
+def test_brand_folders_and_user_presets_are_searchable(tmp_path: Path) -> None:
+    brand = tmp_path / "system" / "OrcaFilamentLibrary" / "filament" / "SUNLU"
+    brand.mkdir(parents=True)
+    (brand / "base.json").write_text(
+        json.dumps(
+            {
+                "type": "filament",
+                "name": "SUNLU PLA+ @base",
+                "instantiation": "false",
+                "inherits": "fdm_filament_pla",
+                "nozzle_temperature": ["210"],
+                "hot_plate_temp": ["60"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (brand / "system.json").write_text(
+        json.dumps(
+            {
+                "type": "filament",
+                "name": "SUNLU PLA+ @System",
+                "instantiation": "true",
+                "inherits": "SUNLU PLA+ @base",
+            }
+        ),
+        encoding="utf-8",
+    )
+    user = tmp_path / "user" / "default" / "filament"
+    user.mkdir(parents=True)
+    (user / "tuned.json").write_text(
+        json.dumps(
+            {
+                "name": "SUNLU PLA+ @System - Tuned",
+                "inherits": "SUNLU PLA+ @System",
+                "nozzle_temperature": ["205"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    found = discover_filaments(tmp_path)
+    names = {item["name"]: item for item in found}
+    assert set(names) == {"SUNLU PLA+ @System", "SUNLU PLA+ @System - Tuned"}
+    assert names["SUNLU PLA+ @System"]["vendor"] == "SUNLU"
+    assert names["SUNLU PLA+ @System"]["nozzle_temperature"] == 210
+    assert names["SUNLU PLA+ @System - Tuned"]["nozzle_temperature"] == 205
+    assert [item["name"] for item in search_filaments(found, "sunlu")] == [
+        "SUNLU PLA+ @System",
+        "SUNLU PLA+ @System - Tuned",
+    ]
+
+
 def test_orca_command_slices_without_arranging(tmp_path: Path) -> None:
     printer = PrinterProfile(
         id="orca:Ender",
@@ -85,6 +181,13 @@ def test_orca_command_slices_without_arranging(tmp_path: Path) -> None:
     assert "--load-assemble-list" in command
     assert "--arrange" not in text
     assert str(mesh) not in command
+
+
+def test_orca_seam_is_stored_separately_from_cura() -> None:
+    values = orca_setting_overrides(SliceSettings(orca_seam="aligned_back"))
+    assert values["seam_position"] == "aligned_back"
+    loaded = SliceSettings.from_dict({"z_seam_type": "random"})
+    assert loaded.orca_seam == "random"
 
 
 def test_shared_settings_map_onto_orca_keys() -> None:

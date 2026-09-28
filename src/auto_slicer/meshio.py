@@ -105,17 +105,23 @@ def transform_mesh(
     machine_width: float,
     machine_depth: float,
     origin: str = "bed_center",
+    *,
+    z: float = 0.0,
+    scale: float = 1.0,
 ) -> list[Triangle]:
-    """Rotate, drop onto Z=0, and place the footprint for the slicer's origin.
+    """Scale, rotate, and place the footprint for the slicer's origin.
 
-    Stored positions are millimetres from the front-left of the bed. CuraEngine
-    expects mesh coordinates whose origin is the bed center, then adds half the
-    bed size when ``machine_center_is_zero`` is false. Orca's printable area
-    starts at the front-left corner, so those meshes keep that origin.
+    Stored positions are millimetres from the front-left of the bed. ``z`` is
+    the height of the lowest point above the bed. CuraEngine expects mesh
+    coordinates whose origin is the bed center, then adds half the bed size
+    when ``machine_center_is_zero`` is false. Orca's printable area starts at
+    the front-left corner, so those meshes keep that origin.
     """
+    if scale <= 0:
+        raise ValueError("scale must be positive")
     rotated = [
         tuple(rotate_xyz(vertex, rotation[0], rotation[1], rotation[2]) for vertex in tri)
-        for tri in triangles
+        for tri in _scale_mesh(triangles, scale)
     ]
     (low_x, low_y, low_z), _high = bounds(rotated)
     if origin == "front_left":
@@ -124,7 +130,7 @@ def transform_mesh(
     else:
         dx = (min_x - machine_width / 2.0) - low_x
         dy = (min_y - machine_depth / 2.0) - low_y
-    dz = -low_z
+    dz = z - low_z
     return [
         tuple((vertex[0] + dx, vertex[1] + dy, vertex[2] + dz) for vertex in tri)
         for tri in rotated

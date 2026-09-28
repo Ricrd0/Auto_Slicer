@@ -12,6 +12,7 @@ def test_defaults_match_the_shop_profile() -> None:
     assert settings.ironing_only_highest_layer is True
     assert settings.z_seam_type == "user_specified"
     assert settings.z_seam_position == "backright"
+    assert settings.orca_seam == "back"
     assert settings.infill_pattern == "lightning"
     assert settings.infill_sparse_density == 5
     assert settings.retraction_combing == "noskin"

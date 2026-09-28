@@ -75,7 +75,11 @@ def generic_pla(config_dir: Path) -> Path | None:
     return None
 
 
-def write_process_profile(path: Path, settings: SliceSettings) -> None:
+def write_process_profile(
+    path: Path,
+    settings: SliceSettings,
+    extra: dict[str, str] | None = None,
+) -> None:
     profile = {
         "type": "process",
         "name": "Auto Slicer",
@@ -84,18 +88,79 @@ def write_process_profile(path: Path, settings: SliceSettings) -> None:
         "instantiation": "true",
     }
     profile.update(orca_setting_overrides(settings))
+    if extra:
+        profile.update(extra)
     path.write_text(json.dumps(profile, indent=2), encoding="utf-8")
 
 
-def write_filament_profile(path: Path) -> None:
-    profile = {
+def write_filament_profile(
+    path: Path,
+    extra: dict[str, object] | None = None,
+    *,
+    name: str = "Generic PLA",
+    inherits: str = "fdm_filament_pla",
+) -> None:
+    profile: dict[str, object] = {
         "type": "filament",
-        "name": "Generic PLA",
-        "inherits": "fdm_filament_pla",
+        "name": name,
+        "inherits": inherits,
         "from": "user",
         "instantiation": "true",
     }
+    if extra:
+        profile.update(extra)
     path.write_text(json.dumps(profile, indent=2), encoding="utf-8")
+
+
+def discover_filaments(config_dir: Path | None) -> list[dict[str, object]]:
+    """Return instantiated Orca filaments with temperatures resolved through inherits."""
+    if config_dir is None or not config_dir.is_dir():
+        return []
+    indexed: dict[str, dict[str, object]] = {}
+    vendors: dict[str, str] = {}
+    selectable: set[str] = set()
+    for kind in ("system", "user"):
+        for path in _filament_jsons(config_dir / kind):
+            data = _read_json(path)
+            if data is None or not _is_filament_profile(data):
+                continue
+            name = str(data.get("name") or path.stem)
+            indexed[name] = data
+            vendors[name] = _filament_brand(path)
+            if _is_selectable_filament(data):
+                selectable.add(name)
+    found: list[dict[str, object]] = []
+    for name in sorted(selectable):
+        resolved = _resolve_filament(name, indexed, set())
+        nozzle = _first_number(resolved.get("nozzle_temperature"))
+        nozzle_initial = _first_number(resolved.get("nozzle_temperature_initial_layer"))
+        bed, bed_initial, plate = _bed_temperatures(resolved)
+        nozzle_value = nozzle if nozzle is not None else 200.0
+        bed_value = bed if bed is not None else 60.0
+        found.append(
+            {
+                "id": f"orca-filament:{name}",
+                "name": name,
+                "vendor": vendors.get(name, ""),
+                "nozzle_temperature": nozzle_value,
+                "nozzle_temperature_initial": nozzle_initial if nozzle_initial is not None else nozzle_value,
+                "bed_temperature": bed_value,
+                "bed_temperature_initial": bed_initial if bed_initial is not None else bed_value,
+                "bed_plate": plate,
+            }
+        )
+    return found
+
+
+def search_filaments(filaments: list[dict[str, object]], query: str) -> list[dict[str, object]]:
+    text = query.strip().lower()
+    if len(text) < 2:
+        return []
+    return [
+        item
+        for item in filaments
+        if text in str(item["name"]).lower() or text in str(item.get("vendor", "")).lower()
+    ]
 
 
 def write_assemble_list(path: Path, meshes: list[Path]) -> None:
@@ -217,19 +282,117 @@ def _load_machine(path: Path, config_dir: Path) -> PrinterProfile | None:
     )
 
 
+_BED_PLATES = (
+    ("cool plate", "cool_plate", "Cool Plate"),
+    ("engineering plate", "eng_plate", "Engineering Plate"),
+    ("hot plate", "hot_plate", "Hot Plate"),
+    ("textured pei plate", "textured_plate", "Textured PEI Plate"),
+    ("textured plate", "textured_plate", "Textured PEI Plate"),
+)
+_PLATE_FALLBACK = ("hot_plate", "cool_plate", "textured_plate", "eng_plate")
+
+
+def _filament_jsons(preset_root: Path) -> list[Path]:
+    return _preset_jsons(preset_root, "filament", nested=True)
+
+
+def _is_filament_profile(data: dict[str, object]) -> bool:
+    kind = data.get("type")
+    if kind == "filament":
+        return True
+    # User presets saved by Orca often omit type and instantiation.
+    return kind is None and bool(data.get("name"))
+
+
+def _is_selectable_filament(data: dict[str, object]) -> bool:
+    if "instantiation" in data:
+        return _is_true(data.get("instantiation"))
+    return True
+
+
+def _filament_brand(path: Path) -> str:
+    folder = path.parent
+    if folder.name == "filament":
+        brand = folder.parent.name
+        return "" if brand == "default" else brand
+    return folder.name
+
+
 def _machine_jsons(preset_root: Path) -> list[Path]:
+    return _preset_jsons(preset_root, "machine")
+
+
+def _preset_jsons(preset_root: Path, kind: str, nested: bool = False) -> list[Path]:
     if not preset_root.is_dir():
         return []
     paths: list[Path] = []
+    pattern = "**/*.json" if nested else "*.json"
     try:
         children = list(preset_root.iterdir())
     except OSError:
         return paths
     for child in children:
-        machine = child / "machine" if child.is_dir() else None
-        if machine is not None and machine.is_dir():
-            paths.extend(sorted(machine.glob("*.json")))
+        folder = child / kind if child.is_dir() else None
+        if folder is not None and folder.is_dir():
+            paths.extend(sorted(folder.glob(pattern)))
     return paths
+
+
+def _read_json(path: Path) -> dict[str, object] | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _resolve_filament(name: str, indexed: dict[str, dict[str, object]], seen: set[str]) -> dict[str, object]:
+    if name in seen or name not in indexed:
+        return {}
+    seen.add(name)
+    data = indexed[name]
+    parent = str(data.get("inherits") or "")
+    merged = _resolve_filament(parent, indexed, seen) if parent else {}
+    for key, value in data.items():
+        if key in {"type", "name", "inherits", "from", "instantiation", "setting_id", "filament_id"}:
+            continue
+        merged[key] = value
+    return merged
+
+
+def _bed_temperatures(resolved: dict[str, object]) -> tuple[float | None, float | None, str]:
+    bed_type = _first_text(resolved.get("bed_type")).lower()
+    for label, plate, title in _BED_PLATES:
+        if bed_type == label and f"{plate}_temp" in resolved:
+            return _plate_pair(resolved, plate, title)
+    for plate in _PLATE_FALLBACK:
+        if f"{plate}_temp" in resolved:
+            title = next(item[2] for item in _BED_PLATES if item[1] == plate)
+            return _plate_pair(resolved, plate, title)
+    return None, None, "Hot Plate"
+
+
+def _plate_pair(resolved: dict[str, object], plate: str, title: str) -> tuple[float | None, float | None, str]:
+    temp = _first_number(resolved.get(f"{plate}_temp"))
+    initial = _first_number(resolved.get(f"{plate}_temp_initial_layer"))
+    return temp, initial if initial is not None else temp, title
+
+
+def _first_text(value: object) -> str:
+    if isinstance(value, list):
+        value = value[0] if value else ""
+    return "" if value is None else str(value)
+
+
+def _first_number(value: object) -> float | None:
+    if isinstance(value, list):
+        value = value[0] if value else None
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _has_machines(root: Path) -> bool:

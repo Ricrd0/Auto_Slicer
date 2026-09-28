@@ -41,6 +41,16 @@ def test_rotation_z_is_applied_before_later_axes() -> None:
     assert turned[2] == pytest_approx(1)
 
 
+def test_transform_scale_and_z_lift_the_mesh() -> None:
+    posed = transform_mesh(_triangle(), (0, 0, 0), 30, 40, 200, 180, "front_left", z=5, scale=2)
+    low, high = bounds(posed)
+    assert low[0] == pytest_approx(30)
+    assert low[1] == pytest_approx(40)
+    assert low[2] == pytest_approx(5)
+    assert high[0] - low[0] == pytest_approx(40)
+    assert high[2] - low[2] == pytest_approx(10)
+
+
 def test_transform_drops_to_bed_and_uses_center_origin() -> None:
     posed = transform_mesh(_triangle(), (0, 0, 0), 90, 85, 200, 180)
     low, high = bounds(posed)

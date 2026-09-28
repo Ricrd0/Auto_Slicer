@@ -11,7 +11,6 @@ import {
   Mesh,
   MeshStandardMaterial,
   PerspectiveCamera,
-  Plane,
   Raycaster,
   Scene,
   Vector2,
@@ -23,12 +22,20 @@ const state = {
   settings: null,
   options: null,
   printers: [],
+  owned: { printers: [], orca_profiles: [] },
+  filaments: { selected_id: null, filaments: [] },
+  filamentEdit: null,
+  filamentCatalog: [],
+  filamentSearch: "idle",
+  tempDraft: null,
+  orcaCatalog: false,
   locations: { input_dir: "", output_dir: "", included: null },
   listing: null,
   models: [],
   groups: [],
   poses: {},
   selectedModel: null,
+  layoutItems: [],
   mode: "orbit",
   drag: null,
   gcodePath: null,
@@ -97,13 +104,14 @@ function parseStl(buffer) {
   return positions;
 }
 
-function geometryFromPositions(positions, rotation) {
+function geometryFromPositions(positions, rotation, scale = 1) {
+  const factor = scale > 0 ? scale : 1;
   const rotated = new Float32Array(positions.length);
   for (let index = 0; index < positions.length; index += 3) {
     const vertex = rotateVertex(
-      positions[index],
-      positions[index + 1],
-      positions[index + 2],
+      positions[index] * factor,
+      positions[index + 1] * factor,
+      positions[index + 2] * factor,
       rotation[0],
       rotation[1],
       rotation[2],
@@ -163,6 +171,8 @@ function setupViewport(canvas, clear) {
 }
 
 function setBed(width, depth) {
+  preview.bedWidth = width;
+  preview.bedDepth = depth;
   const points = [new Vector3(0, 0, 0), new Vector3(width, 0, 0), new Vector3(width, depth, 0), new Vector3(0, depth, 0)];
   bed.geometry.dispose();
   bed.geometry = new BufferGeometry().setFromPoints(points);
@@ -196,27 +206,41 @@ async function showLayout() {
   const error = $("layout-error");
   error.textContent = "";
   clearParts();
-  if (!printer) return;
+  if (!printer) {
+    state.layoutItems = [];
+    renderPoseFields();
+    return;
+  }
   const kind = $("preview-kind").value;
   const body = { printer_id: printer, kind };
   if (kind === "model") {
-    if (!state.selectedModel) return;
+    if (!state.selectedModel) {
+      state.layoutItems = [];
+      renderPoseFields();
+      return;
+    }
     body.model = state.selectedModel;
   } else {
     body.group_id = $("preview-group").value;
-    if (!body.group_id) return;
+    if (!body.group_id) {
+      state.layoutItems = [];
+      renderPoseFields();
+      return;
+    }
   }
   try {
     const layout = await api("/api/layout", { method: "POST", body: JSON.stringify(body) });
     setBed(layout.bed_width, layout.bed_depth);
+    state.layoutItems = layout.items;
     if (layout.error) error.textContent = layout.error;
     for (const item of layout.items) {
       const positions = await loadMesh(item.file);
-      const geometry = geometryFromPositions(positions, item.rotation);
+      const geometry = geometryFromPositions(positions, item.rotation, item.scale || 1);
       const mesh = new Mesh(geometry, item.file === state.selectedModel ? selectedMaterial : partMaterial);
-      mesh.position.set(item.min_x, item.min_y, 0);
+      mesh.position.set(item.min_x, item.min_y, item.z || 0);
       mesh.userData.file = item.file;
       mesh.userData.positions = positions;
+      mesh.userData.scale = item.scale || 1;
       preview.scene.add(mesh);
     }
     renderPoseFields();
@@ -225,37 +249,115 @@ async function showLayout() {
   }
 }
 
+function poseNumber(value) {
+  return String(Math.round(Number(value) * 1000) / 1000);
+}
+
+async function savePartField(file, key, value) {
+  const item = (state.layoutItems || []).find((entry) => entry.file === file);
+  if (!item || Number.isNaN(value)) return;
+  const pose = { ...(state.poses[file] || {}) };
+  if (key === "rx" || key === "ry" || key === "rz") {
+    const rotation = (pose.rotation || item.rotation || [0, 0, 0]).slice();
+    rotation[{ rx: 0, ry: 1, rz: 2 }[key]] = value;
+    pose.rotation = rotation;
+    state.poses[file] = pose;
+    await api("/api/poses", { method: "PUT", body: JSON.stringify({ path: file, rotation }) });
+  } else if (key === "scale") {
+    const scale = value > 0 ? value : 1;
+    pose.scale = scale;
+    state.poses[file] = pose;
+    await api("/api/poses", { method: "PUT", body: JSON.stringify({ path: file, scale }) });
+  } else if (key === "z") {
+    pose.z = value;
+    state.poses[file] = pose;
+    await api("/api/poses", { method: "PUT", body: JSON.stringify({ path: file, z: value }) });
+  } else if ($("preview-kind").value === "group") {
+    const layout = await api("/api/groups/layout", {
+      method: "PUT",
+      body: JSON.stringify({
+        id: $("preview-group").value,
+        printer_id: $("preview-printer").value,
+        file,
+        x: key === "x" ? value : item.min_x,
+        y: key === "y" ? value : item.min_y,
+      }),
+    });
+    const group = state.groups.find((entry) => entry.id === $("preview-group").value);
+    if (group) {
+      group.manual_layout = Object.fromEntries(layout.items.map((entry) => [entry.file, { x: entry.min_x, y: entry.min_y }]));
+    }
+  } else {
+    const position = [key === "x" ? value : item.min_x, key === "y" ? value : item.min_y];
+    pose.position = position;
+    state.poses[file] = pose;
+    await api("/api/poses", { method: "PUT", body: JSON.stringify({ path: file, position }) });
+  }
+  await showLayout();
+}
+
 function renderPoseFields() {
   const root = $("pose-fields");
   root.innerHTML = "";
-  const file = state.selectedModel;
-  if (!file) return;
-  const rotation = effectiveRotation(file);
-  for (const [index, axis] of ["X", "Y", "Z"].entries()) {
-    const label = document.createElement("label");
-    label.textContent = `Rotation ${axis}`;
-    const input = document.createElement("input");
-    input.type = "number";
-    input.step = "1";
-    input.value = String(Math.round(rotation[index] * 1000) / 1000);
-    input.addEventListener("change", async () => {
-      const next = effectiveRotation(file).slice();
-      next[index] = Number(input.value);
-      state.poses[file] = { ...(state.poses[file] || {}), rotation: next };
-      await api("/api/poses", { method: "PUT", body: JSON.stringify({ path: file, rotation: next }) });
-      await showLayout();
-    });
-    label.append(input);
-    root.append(label);
+  const items = state.layoutItems || [];
+  if (!items.length) return;
+  const note = document.createElement("p");
+  note.className = "muted";
+  note.textContent = "X and Y are millimetres from the front-left of the bed to the front-left of the part. Z is the gap under the part. Scale is uniform.";
+  root.append(note);
+  for (const item of items) {
+    const card = document.createElement("fieldset");
+    card.className = "pose-part";
+    const legend = document.createElement("legend");
+    legend.textContent = item.file.split(/[/\\]/).pop();
+    card.append(legend);
+    const grid = document.createElement("div");
+    grid.className = "pose-grid";
+    const rotation = item.rotation || [0, 0, 0];
+    const fields = [
+      ["X (mm)", item.min_x, "x", "0.1"],
+      ["Y (mm)", item.min_y, "y", "0.1"],
+      ["Z (mm)", item.z || 0, "z", "0.1"],
+      ["Rotation X", rotation[0], "rx", "1"],
+      ["Rotation Y", rotation[1], "ry", "1"],
+      ["Rotation Z", rotation[2], "rz", "1"],
+      ["Scale", item.scale || 1, "scale", "0.01"],
+    ];
+    for (const [label, raw, key, step] of fields) {
+      const wrap = document.createElement("label");
+      wrap.textContent = label;
+      const input = document.createElement("input");
+      input.type = "number";
+      input.step = step;
+      if (key === "scale") input.min = "0.01";
+      input.value = poseNumber(raw);
+      input.addEventListener("change", () => savePartField(item.file, key, Number(input.value)));
+      wrap.append(input);
+      grid.append(wrap);
+    }
+    card.append(grid);
+    root.append(card);
   }
+}
+
+function bedDirections() {
+  preview.camera.updateMatrixWorld();
+  const right = new Vector3().setFromMatrixColumn(preview.camera.matrixWorld, 0);
+  right.z = 0;
+  if (right.lengthSq() < 1e-6) right.set(1, 0, 0);
+  else right.normalize();
+  const forward = new Vector3().setFromMatrixColumn(preview.camera.matrixWorld, 2);
+  forward.z = 0;
+  forward.negate();
+  if (forward.lengthSq() < 1e-6) forward.set(0, 1, 0);
+  else forward.normalize();
+  return { right, forward };
 }
 
 function bindPreviewPointer() {
   const canvas = preview.canvas;
   const raycaster = new Raycaster();
   const pointer = new Vector2();
-  const plane = new Plane(new Vector3(0, 0, 1), 0);
-  const hit = new Vector3();
 
   function pointerRay(event) {
     const rect = canvas.getBoundingClientRect();
@@ -272,15 +374,17 @@ function bindPreviewPointer() {
     }
     const meshes = preview.scene.children.filter((child) => child.userData.file);
     const intersections = raycaster.intersectObjects(meshes, false);
-    if (!intersections.length || !raycaster.ray.intersectPlane(plane, hit)) return;
+    if (!intersections.length) return;
     const mesh = intersections[0].object;
     state.selectedModel = mesh.userData.file;
     if (state.mode === "move") {
       state.drag = {
         kind: "move",
         mesh,
-        offsetX: hit.x - mesh.position.x,
-        offsetY: hit.y - mesh.position.y,
+        startX: event.clientX,
+        startY: event.clientY,
+        originX: mesh.position.x,
+        originY: mesh.position.y,
       };
     } else {
       const rotation = effectiveRotation(mesh.userData.file).slice();
@@ -306,16 +410,18 @@ function bindPreviewPointer() {
       return;
     }
     if (state.drag.kind === "move") {
-      pointerRay(event);
-      if (!raycaster.ray.intersectPlane(plane, hit)) return;
-      state.drag.mesh.position.x = hit.x - state.drag.offsetX;
-      state.drag.mesh.position.y = hit.y - state.drag.offsetY;
+      const { right, forward } = bedDirections();
+      const dx = event.clientX - state.drag.startX;
+      const dy = event.clientY - state.drag.startY;
+      const mmPerPixel = ((preview.bedWidth || 220) / Math.max(canvas.clientWidth, 1)) * 0.45;
+      state.drag.mesh.position.x = state.drag.originX + (dx * right.x - dy * forward.x) * mmPerPixel;
+      state.drag.mesh.position.y = state.drag.originY + (dx * right.y - dy * forward.y) * mmPerPixel;
       return;
     }
     const next = state.drag.base.slice();
-    next[state.drag.index] = state.drag.base[state.drag.index] + (event.clientX - state.drag.startX) * 0.4;
+    next[state.drag.index] = state.drag.base[state.drag.index] + (state.drag.startX - event.clientX) * 0.15;
     state.poses[state.drag.file] = { ...(state.poses[state.drag.file] || {}), rotation: next };
-    const geometry = geometryFromPositions(state.drag.positions, next);
+    const geometry = geometryFromPositions(state.drag.positions, next, state.drag.mesh.userData.scale || 1);
     state.drag.mesh.geometry.dispose();
     state.drag.mesh.geometry = geometry;
     return;
@@ -382,6 +488,30 @@ function field(name, label, type, extra = {}) {
   return wrap;
 }
 
+function seamSpecs(options) {
+  if ((state.settings?.slicer_engine || "cura") === "orca") {
+    return [[
+      "orca_seam",
+      "Seam",
+      "select",
+      {
+        options: options.orca_seam_positions,
+        labels: {
+          nearest: "Nearest",
+          aligned: "Aligned",
+          aligned_back: "Aligned back",
+          back: "Back",
+          random: "Random",
+        },
+      },
+    ]];
+  }
+  return [
+    ["z_seam_type", "Seam", "select", { options: options.seam_types }],
+    ["z_seam_position", "Seam position", "select", { options: options.seam_positions }],
+  ];
+}
+
 function renderSettings() {
   const form = $("settings-form");
   const options = state.options;
@@ -394,8 +524,7 @@ function renderSettings() {
     ["layer_height", "Layer height (mm)", "number", { step: "0.01" }],
     ["ironing_enabled", "Ironing", "checkbox"],
     ["ironing_only_highest_layer", "Ironing top layer only", "checkbox"],
-    ["z_seam_type", "Seam", "select", { options: options.seam_types }],
-    ["z_seam_position", "Seam position", "select", { options: options.seam_positions }],
+    ...seamSpecs(options),
     ["infill_pattern", "Infill", "select", { options: options.infill_patterns }],
     ["infill_sparse_density", "Infill density (%)", "number", { step: "1" }],
     ["retraction_combing", "Combing", "select", { options: options.combing_modes }],
@@ -432,22 +561,38 @@ async function saveSettings() {
   }
   state.settings = await api("/api/settings", { method: "PUT", body: JSON.stringify(payload) });
   if (state.settings.slicer_engine !== previousEngine) {
-    state.printers = await api("/api/printers");
-    renderPrinters();
+    state.orcaCatalog = false;
+    $("orca-catalog").checked = false;
+    await loadPrinters();
+    renderFilaments();
+    renderOwnedForm();
+    renderSettings();
   }
   if ($("models").classList.contains("active")) await showLayout();
+}
+
+async function loadPrinters() {
+  const catalog = state.settings?.slicer_engine === "orca" && state.orcaCatalog;
+  state.printers = await api(`/api/printers${catalog ? "?catalog=true" : ""}`);
+  renderPrinters();
 }
 
 function renderPrinters() {
   const notice = $("printer-notice");
   const engine = state.settings?.slicer_engine || "cura";
   const root = engine === "orca" ? state.health?.orca_config_dir : state.health?.config_dir;
+  $("show-all-orca").hidden = engine !== "orca";
+  const ownedIds = new Set((state.owned?.printers || []).map((item) => item.orca_id).filter(Boolean));
   if (!state.printers.length) {
     notice.textContent = engine === "orca"
-      ? `No Orca printers${root ? ` in ${root}` : ""}. Orca keeps machine profiles under %APPDATA%\\OrcaSlicer.`
+      ? "No Orca profiles are linked to your printers yet. Show every Orca printer to add the ones you own."
       : root
         ? `No printers in ${root}. Cura keeps machine profiles in a version folder such as %APPDATA%\\cura\\5.13 (the folder that contains machine_instances).`
         : "No printers found.";
+  } else if (engine === "orca" && !state.orcaCatalog) {
+    notice.textContent = `Showing the ${state.printers.length} Orca profiles linked to your printers${root ? ` from ${root}` : ""}.`;
+  } else if (engine === "orca") {
+    notice.textContent = `Showing every Orca printer${root ? ` from ${root}` : ""}. Add a machine to keep it in the default list.`;
   } else {
     notice.textContent = root ? `Loaded from ${root}` : "";
   }
@@ -463,11 +608,20 @@ function renderPrinters() {
     select.append(option);
     const row = document.createElement("tr");
     const notes = [printer.error, ...(printer.warnings || [])].filter(Boolean).join(" ");
+    const canAdd = engine === "orca" && state.orcaCatalog && !ownedIds.has(printer.id);
     row.innerHTML = `<td><input type="checkbox" ${printer.enabled ? "checked" : ""} ${printer.slicable ? "" : "disabled"}></td>
       <td>${printer.name}</td>
       <td>${printer.machine_width ?? "?"} × ${printer.machine_depth ?? "?"} × ${printer.machine_height ?? "?"}</td>
       <td class="${printer.error ? "" : "muted"}">${notes}</td>
-      <td><a href="/api/bundles?printer_id=${encodeURIComponent(printer.id)}">Download</a></td>`;
+      <td>${canAdd ? `<button type="button">Add</button>` : `<a href="/api/bundles?printer_id=${encodeURIComponent(printer.id)}">Download</a>`}</td>`;
+    if (canAdd) {
+      row.querySelector("button").addEventListener("click", async () => {
+        await api("/api/owned", { method: "POST", body: JSON.stringify({ orca_id: printer.id }) });
+        state.owned = await api("/api/owned");
+        renderOwned();
+        await loadPrinters();
+      });
+    }
     row.querySelector("input").addEventListener("change", async (event) => {
       await api("/api/printers/enabled", {
         method: "PUT",
@@ -676,10 +830,493 @@ document.querySelectorAll("nav button").forEach((button) => {
   });
 });
 
+const TEMP_FIELDS = [
+  "nozzle_temperature",
+  "nozzle_temperature_initial",
+  "bed_temperature",
+  "bed_temperature_initial",
+];
+
+const OWNED_SECTIONS = [
+  ["Dimensions", [
+    ["bed_width", "Bed width (mm)", "number", "0.1"],
+    ["bed_depth", "Bed depth (mm)", "number", "0.1"],
+    ["bed_height", "Bed height (mm)", "number", "0.1"],
+    ["nozzle_diameter", "Nozzle diameter (mm)", "number", "0.1"],
+  ]],
+  ["Machine configuration", [
+    ["heated_bed", "Heated bed", "checkbox"],
+    ["gcode_flavor", "G-code flavor", "select"],
+  ]],
+  ["Temperatures", [
+    ["temperature_override", "Use this printer's temperatures", "checkbox"],
+    ["nozzle_temperature", "Nozzle temperature (°C)", "number", "1"],
+    ["nozzle_temperature_initial", "Initial nozzle temperature (°C)", "number", "1"],
+    ["bed_temperature", "Bed temperature (°C)", "number", "1"],
+    ["bed_temperature_initial", "Initial bed temperature (°C)", "number", "1"],
+  ]],
+  ["Speeds", [
+    ["retraction_length", "Retraction length (mm)", "number", "0.1"],
+    ["retraction_speed", "Retraction speed (mm/s)", "number", "1"],
+    ["z_hop", "Z hop (mm)", "number", "0.1"],
+    ["travel_speed", "Travel speed (mm/s)", "number", "1"],
+  ]],
+];
+
+function selectedOwned() {
+  return (state.owned?.printers || []).find((item) => item.id === $("owned-printer").value) || null;
+}
+
+function renderOwned() {
+  const select = $("owned-printer");
+  const previous = select.value;
+  select.innerHTML = "";
+  for (const printer of state.owned?.printers || []) {
+    const option = document.createElement("option");
+    option.value = printer.id;
+    option.textContent = printer.name;
+    select.append(option);
+  }
+  if ([...select.options].some((option) => option.value === previous)) select.value = previous;
+  renderOwnedForm();
+}
+
+function selectedFilament() {
+  return (state.filaments?.filaments || []).find((item) => item.id === state.filaments.selected_id) || null;
+}
+
+function renderOwnedForm() {
+  const form = $("owned-form");
+  const printer = selectedOwned();
+  const notice = $("owned-notice");
+  form.innerHTML = "";
+  renderFilaments();
+  if (!printer) {
+    notice.textContent = "No printers are available yet.";
+    return;
+  }
+  notice.textContent = ownedNotice(printer);
+  const settings = displayedSettings(printer);
+  state.tempDraft = null;
+  for (const [title, fields] of OWNED_SECTIONS) {
+    const section = document.createElement("fieldset");
+    section.className = "settings-section";
+    const legend = document.createElement("legend");
+    legend.textContent = title;
+    section.append(legend);
+    const grid = document.createElement("div");
+    grid.className = "grid";
+    if (title === "Machine configuration") grid.append(orcaProfileField(printer));
+    for (const spec of fields) grid.append(ownedField(spec, settings));
+    if (title === "Temperatures") {
+      const hint = document.createElement("p");
+      hint.id = "temperature-note";
+      hint.className = "muted span-2";
+      grid.append(hint);
+    }
+    section.append(grid);
+    form.append(section);
+  }
+  const scripts = document.createElement("fieldset");
+  scripts.className = "settings-section";
+  const legend = document.createElement("legend");
+  legend.textContent = "Custom G-code";
+  scripts.append(legend);
+  const grid = document.createElement("div");
+  grid.className = "grid";
+  for (const [name, label] of [
+    ["cura_start_gcode", "Cura start G-code"],
+    ["cura_end_gcode", "Cura end G-code"],
+    ["orca_start_gcode", "Orca start G-code"],
+    ["orca_end_gcode", "Orca end G-code"],
+  ]) {
+    const wrap = document.createElement("label");
+    wrap.className = "span-2";
+    wrap.textContent = label;
+    const input = document.createElement("textarea");
+    input.name = name;
+    input.value = settings[name] || "";
+    wrap.append(input);
+    grid.append(wrap);
+  }
+  const copy = document.createElement("div");
+  copy.className = "toolbar span-2";
+  copy.innerHTML = `<button type="button" id="copy-scripts-to-orca">Copy Cura scripts to Orca</button>
+    <button type="button" id="copy-scripts-to-cura">Copy Orca scripts to Cura</button>`;
+  grid.append(copy);
+  scripts.append(grid);
+  form.append(scripts);
+  form.querySelector("#copy-scripts-to-orca").addEventListener("click", () => {
+    form.elements.orca_start_gcode.value = form.elements.cura_start_gcode.value;
+    form.elements.orca_end_gcode.value = form.elements.cura_end_gcode.value;
+  });
+  form.querySelector("#copy-scripts-to-cura").addEventListener("click", () => {
+    form.elements.cura_start_gcode.value = form.elements.orca_start_gcode.value;
+    form.elements.cura_end_gcode.value = form.elements.orca_end_gcode.value;
+  });
+  form.elements.temperature_override.addEventListener("change", () => syncTemperatureFields(true));
+  syncTemperatureFields(false);
+}
+
+function orcaProfileField(printer) {
+  const link = document.createElement("label");
+  link.textContent = "Orca profile";
+  const orca = document.createElement("select");
+  orca.name = "orca_id";
+  const empty = document.createElement("option");
+  empty.value = "";
+  empty.textContent = "None";
+  orca.append(empty);
+  for (const profile of state.owned.orca_profiles || []) {
+    const option = document.createElement("option");
+    option.value = profile.id;
+    option.textContent = profile.name;
+    orca.append(option);
+  }
+  orca.value = printer.orca_id || "";
+  link.append(orca);
+  return link;
+}
+
+function ownedField([name, label, type, step], settings) {
+  const wrap = document.createElement("label");
+  wrap.textContent = label;
+  const input = document.createElement(type === "select" ? "select" : "input");
+  input.name = name;
+  if (type === "checkbox") {
+    input.type = "checkbox";
+    input.checked = Boolean(settings[name]);
+    wrap.classList.add("inline");
+  } else if (type === "select") {
+    for (const flavor of state.options.gcode_flavors || []) {
+      const option = document.createElement("option");
+      option.value = flavor;
+      option.textContent = flavor;
+      input.append(option);
+    }
+    input.value = settings[name] || "Marlin";
+  } else {
+    input.type = "number";
+    input.step = step;
+    input.value = settings[name] ?? "";
+  }
+  wrap.append(input);
+  if (name === "gcode_flavor") {
+    const hint = document.createElement("span");
+    hint.className = "muted";
+    hint.textContent = "Orca writes Klipper. Cura has no Klipper flavor, so a Cura slice uses Marlin gcode, which Klipper runs.";
+    wrap.append(hint);
+  }
+  if (name === "temperature_override") {
+    const hint = document.createElement("span");
+    hint.className = "muted";
+    hint.textContent = state.settings?.slicer_engine === "orca"
+      ? "Off uses the filament selected above. On keeps the temperatures saved for this printer."
+      : "Off uses the shared filament. That list is edited while Orca is the slicing engine.";
+    wrap.append(hint);
+  }
+  return wrap;
+}
+
+function syncTemperatureFields(fromToggle) {
+  const form = $("owned-form");
+  const printer = selectedOwned();
+  if (!form.elements.temperature_override || !printer) return;
+  const override = form.elements.temperature_override.checked;
+  const filament = selectedFilament();
+  const follow = !override && Boolean(filament);
+  if (fromToggle && !override) state.tempDraft = readTemperatures(form);
+  const source = follow ? filament : (state.tempDraft || printer.settings || {});
+  for (const name of TEMP_FIELDS) {
+    const input = form.elements[name];
+    input.disabled = follow;
+    if (follow || (fromToggle && override)) input.value = source[name] ?? "";
+  }
+  const note = $("temperature-note");
+  if (note) note.textContent = temperatureNote(override, filament, source);
+}
+
+function readTemperatures(form) {
+  const values = {};
+  for (const name of TEMP_FIELDS) values[name] = Number(form.elements[name].value);
+  return values;
+}
+
+function temperatureNote(override, filament, source) {
+  const nozzle = source.nozzle_temperature ?? "";
+  const nozzleInitial = source.nozzle_temperature_initial ?? "";
+  const bed = source.bed_temperature ?? "";
+  const bedInitial = source.bed_temperature_initial ?? "";
+  const inherits = filament?.orca_name || "fdm_filament_pla";
+  const filamentName = filament?.name || "Generic PLA";
+  const using = !override && filament
+    ? `Using ${filamentName} for this printer.`
+    : "Using this printer's temperatures.";
+  const orca = state.settings?.slicer_engine === "orca"
+    ? ` Orca writes them on filament “${filamentName}” (inherits ${inherits}): nozzle_temperature ${nozzle}, nozzle_temperature_initial_layer ${nozzleInitial}, and cool_plate_temp, eng_plate_temp, hot_plate_temp, textured_plate_temp ${bed}, with each plate's initial layer at ${bedInitial}.`
+    : "";
+  const cura = ` Cura writes material_print_temperature ${nozzle}, material_print_temperature_layer_0 ${nozzleInitial}, material_bed_temperature ${bed}, and material_bed_temperature_layer_0 ${bedInitial}.`;
+  return using + orca + cura;
+}
+
+function renderFilaments() {
+  const panel = $("filament-panel");
+  const orca = state.settings?.slicer_engine === "orca";
+  panel.hidden = !orca;
+  if (!orca) return;
+  const select = $("filament-selected");
+  const previous = select.value;
+  select.innerHTML = "";
+  const none = document.createElement("option");
+  none.value = "";
+  none.textContent = "None";
+  select.append(none);
+  for (const filament of state.filaments?.filaments || []) {
+    const option = document.createElement("option");
+    option.value = filament.id;
+    option.textContent = filament.name;
+    select.append(option);
+  }
+  const wanted = state.filaments?.selected_id || previous;
+  if ([...select.options].some((option) => option.value === wanted)) select.value = wanted;
+  const list = $("filament-list");
+  list.innerHTML = "";
+  const filaments = state.filaments?.filaments || [];
+  $("filament-notice").textContent = filaments.length
+    ? "Select a row to edit its temperatures. Adding a filament selects it for every printer when none is selected yet."
+    : "Search the Orca catalog and add the filaments you print with.";
+  for (const filament of filaments) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = `${filament.name} — nozzle ${filament.nozzle_temperature}° / ${filament.nozzle_temperature_initial}° · bed ${filament.bed_temperature}° / ${filament.bed_temperature_initial}°`;
+    if (filament.id === state.filamentEdit) button.classList.add("primary");
+    button.addEventListener("click", () => {
+      state.filamentEdit = filament.id;
+      renderFilamentForm();
+      renderFilaments();
+    });
+    list.append(button);
+  }
+  renderFilamentForm();
+  fillCatalogSelect();
+}
+
+function renderFilamentForm() {
+  const form = $("filament-form");
+  const filament = (state.filaments?.filaments || []).find((item) => item.id === state.filamentEdit);
+  form.innerHTML = "";
+  if (!filament) return;
+  const fields = [
+    ["name", "Name", "text"],
+    ["nozzle_temperature", "Nozzle temperature (°C)", "number"],
+    ["nozzle_temperature_initial", "Initial nozzle temperature (°C)", "number"],
+    ["bed_temperature", "Bed temperature (°C)", "number"],
+    ["bed_temperature_initial", "Initial bed temperature (°C)", "number"],
+  ];
+  for (const [name, label, type] of fields) {
+    const wrap = document.createElement("label");
+    wrap.textContent = label;
+    const input = document.createElement("input");
+    input.name = name;
+    input.type = type;
+    if (type === "number") input.step = "1";
+    input.value = filament[name] ?? "";
+    wrap.append(input);
+    form.append(wrap);
+  }
+  const actions = document.createElement("div");
+  actions.className = "toolbar span-2";
+  actions.innerHTML = `<button type="button" id="save-filament" class="primary">Save filament</button>
+    <button type="button" id="delete-filament">Remove</button>`;
+  form.append(actions);
+  const keys = document.createElement("p");
+  keys.className = "muted span-2";
+  const inherits = filament.orca_name || "fdm_filament_pla";
+  keys.textContent = `Saved temperatures override ${inherits}: nozzle_temperature, nozzle_temperature_initial_layer, and the cool, engineering, hot, and textured plate keys, including each initial-layer key.`;
+  form.append(keys);
+  form.querySelector("#save-filament").addEventListener("click", saveFilament);
+  form.querySelector("#delete-filament").addEventListener("click", deleteFilament);
+}
+
+function fillCatalogSelect() {
+  const select = $("filament-catalog");
+  const previous = select.value;
+  select.innerHTML = "";
+  if (!state.filamentCatalog.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = state.filamentSearch === "ok" ? "No matching filaments" : "Search to list filaments";
+    select.append(option);
+    return;
+  }
+  for (const filament of state.filamentCatalog) {
+    const option = document.createElement("option");
+    option.value = filament.id;
+    option.textContent = `${filament.vendor ? `${filament.vendor} · ` : ""}${filament.name} — ${filament.bed_plate} ${filament.bed_temperature}° / nozzle ${filament.nozzle_temperature}°`;
+    select.append(option);
+  }
+  if ([...select.options].some((option) => option.value === previous)) select.value = previous;
+}
+
+async function saveFilament() {
+  const filament = (state.filaments?.filaments || []).find((item) => item.id === state.filamentEdit);
+  if (!filament) return;
+  const form = $("filament-form");
+  const payload = { ...filament };
+  for (const input of form.querySelectorAll("input")) {
+    payload[input.name] = input.type === "number" ? Number(input.value) : input.value;
+  }
+  const saved = await api("/api/filaments", { method: "PUT", body: JSON.stringify(payload) });
+  state.filaments = await api("/api/filaments");
+  state.filamentEdit = saved.id;
+  renderFilaments();
+  syncTemperatureFields(false);
+}
+
+async function deleteFilament() {
+  if (!state.filamentEdit) return;
+  state.filaments = await api(`/api/filaments?filament_id=${encodeURIComponent(state.filamentEdit)}`, { method: "DELETE" });
+  state.filamentEdit = state.filaments.filaments[0]?.id || null;
+  renderFilaments();
+  syncTemperatureFields(false);
+}
+
+function displayedSettings(printer) {
+  if (state.settings?.slicer_engine === "orca" && printer.orca_settings) return printer.orca_settings;
+  if (state.settings?.slicer_engine !== "orca" && printer.cura_settings) return printer.cura_settings;
+  return printer.settings || {};
+}
+
+function ownedNotice(printer, extra = "") {
+  const cura = printer.cura_settings ? "Cura uses its own saved settings" : "Cura uses the shared settings";
+  const orca = printer.orca_settings ? "Orca uses its own saved settings" : "Orca uses the shared settings";
+  const base = `Cura profile: ${printer.cura_name || "none"} · Orca profile: ${printer.orca_name || "none"}. ${cura}. ${orca}.`;
+  return extra ? `${extra} ${base}` : base;
+}
+
+function ownedPayload() {
+  const printer = selectedOwned();
+  const form = $("owned-form");
+  const settings = { ...(displayedSettings(printer)) };
+  for (const input of form.querySelectorAll("input, select, textarea")) {
+    if (input.name === "orca_id" || input.disabled) continue;
+    settings[input.name] = input.type === "checkbox" ? input.checked : input.type === "number" ? Number(input.value) : input.value;
+  }
+  if (!settings.temperature_override && state.tempDraft) {
+    Object.assign(settings, state.tempDraft);
+  }
+  return {
+    ...printer,
+    orca_id: form.elements.orca_id.value || null,
+    settings,
+  };
+}
+
+$("owned-printer").addEventListener("change", renderOwnedForm);
+$("save-cura").addEventListener("click", () => saveOwned("cura"));
+$("save-orca").addEventListener("click", () => saveOwned("orca"));
+$("save-owned").addEventListener("click", () => saveOwned("both"));
+
+async function saveOwned(scope) {
+  const saved = await api("/api/owned", { method: "PUT", body: JSON.stringify({ ...ownedPayload(), scope }) });
+  state.owned = await api("/api/owned");
+  $("owned-printer").value = saved.id;
+  if (scope === "both") {
+    renderOwned();
+  } else {
+    const printer = selectedOwned();
+    const label = scope === "cura" ? "Saved for Cura." : "Saved for Orca.";
+    if (printer) $("owned-notice").textContent = ownedNotice(printer, label);
+  }
+  if (state.settings?.slicer_engine === "orca") await loadPrinters();
+}
+
+$("pull-cura").addEventListener("click", async () => {
+  const printer = selectedOwned();
+  if (!printer) return;
+  const pulled = await api("/api/owned/pull", { method: "POST", body: JSON.stringify({ id: printer.id, engine: "cura" }) });
+  printer.settings = pulled.settings;
+  if (printer.cura_settings && state.settings?.slicer_engine !== "orca") printer.cura_settings = pulled.settings;
+  renderOwnedForm();
+});
+$("pull-orca").addEventListener("click", async () => {
+  const printer = selectedOwned();
+  if (!printer) return;
+  const pulled = await api("/api/owned/pull", { method: "POST", body: JSON.stringify({ id: printer.id, engine: "orca" }) });
+  printer.settings = pulled.settings;
+  if (printer.orca_settings && state.settings?.slicer_engine === "orca") printer.orca_settings = pulled.settings;
+  renderOwnedForm();
+});
+
+$("filament-selected").addEventListener("change", async () => {
+  state.filaments = await api("/api/filaments/selected", {
+    method: "PUT",
+    body: JSON.stringify({ id: $("filament-selected").value }),
+  });
+  syncTemperatureFields(false);
+  renderFilaments();
+});
+
+let filamentSearchTimer = 0;
+let filamentSearchRequest = 0;
+
+function setFilamentSearchStatus(status, detail = "") {
+  state.filamentSearch = status;
+  const node = $("filament-search-status");
+  node.className = `search-status${status === "idle" ? "" : ` ${status}`}`;
+  node.textContent = status === "ok" ? "✓" : status === "error" ? "×" : "";
+  node.title = detail;
+  node.setAttribute("aria-label", detail);
+}
+
+$("filament-search").addEventListener("input", () => {
+  clearTimeout(filamentSearchTimer);
+  const query = $("filament-search").value.trim();
+  const request = ++filamentSearchRequest;
+  if (query.length < 2) {
+    state.filamentCatalog = [];
+    setFilamentSearchStatus("idle", "");
+    fillCatalogSelect();
+    return;
+  }
+  setFilamentSearchStatus("loading", "Searching filaments");
+  filamentSearchTimer = setTimeout(async () => {
+    try {
+      const found = await api(`/api/filaments/catalog?q=${encodeURIComponent(query)}`);
+      if (request !== filamentSearchRequest) return;
+      state.filamentCatalog = found;
+      const label = found.length === 1 ? "1 filament" : `${found.length} filaments`;
+      setFilamentSearchStatus("ok", label);
+      fillCatalogSelect();
+    } catch (error) {
+      if (request !== filamentSearchRequest) return;
+      state.filamentCatalog = [];
+      setFilamentSearchStatus("error", error.message || "Search failed");
+      fillCatalogSelect();
+    }
+  }, 250);
+});
+
+$("filament-add").addEventListener("click", async () => {
+  const orcaId = $("filament-catalog").value;
+  if (!orcaId) return;
+  const saved = await api("/api/filaments", { method: "POST", body: JSON.stringify({ orca_id: orcaId }) });
+  state.filaments = await api("/api/filaments");
+  state.filamentEdit = saved.id;
+  renderFilaments();
+  syncTemperatureFields(false);
+});
+
+$("orca-catalog").addEventListener("change", async (event) => {
+  state.orcaCatalog = event.target.checked;
+  await loadPrinters();
+});
+
 $("refresh-printers").addEventListener("click", async () => {
   state.health = await api("/api/health");
-  state.printers = await api("/api/printers");
-  renderPrinters();
+  state.owned = await api("/api/owned");
+  await loadPrinters();
+  renderOwned();
 });
 $("upload-bundle").addEventListener("change", async (event) => {
   const file = event.target.files[0];
@@ -808,7 +1445,10 @@ $("mode-rotate").addEventListener("click", () => setMode("rotate"));
 $("reset-pose").addEventListener("click", async () => {
   if (!state.selectedModel) return;
   delete state.poses[state.selectedModel];
-  await api("/api/poses", { method: "PUT", body: JSON.stringify({ path: state.selectedModel, rotation: null, position: null }) });
+  await api("/api/poses", {
+    method: "PUT",
+    body: JSON.stringify({ path: state.selectedModel, rotation: null, position: null, z: null, scale: null }),
+  });
   await showLayout();
 });
 $("reset-layout").addEventListener("click", async () => {
@@ -870,6 +1510,8 @@ const boot = await Promise.all([
   api("/api/groups"),
   api("/api/poses"),
   api("/api/jobs/current"),
+  api("/api/owned"),
+  api("/api/filaments"),
 ]);
 const curaReady = boot[0].cura_engine || boot[0].engine;
 $("engine-status").textContent = `${curaReady ? "CuraEngine ready" : "CuraEngine was not found"} · ${boot[0].orca_engine ? "OrcaSlicer ready" : "OrcaSlicer was not found"}`;
@@ -877,12 +1519,16 @@ state.health = boot[0];
 state.options = boot[1];
 state.settings = boot[2];
 state.printers = boot[3];
+state.owned = boot[9];
+state.filaments = boot[10];
+state.filamentEdit = boot[10].filaments[0]?.id || null;
 state.models = boot[4];
 state.locations = boot[5];
 state.groups = boot[6].groups;
 state.poses = boot[7];
 renderSettings();
 renderPrinters();
+renderOwned();
 renderPaths();
 renderModels();
 renderJob(boot[8]);

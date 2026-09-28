@@ -39,6 +39,14 @@ SEAM_POSITIONS: tuple[SeamPosition, ...] = (
     "frontleft",
     "left",
 )
+OrcaSeam = Literal["nearest", "aligned", "aligned_back", "back", "random"]
+ORCA_SEAM_POSITIONS: tuple[OrcaSeam, ...] = (
+    "nearest",
+    "aligned",
+    "aligned_back",
+    "back",
+    "random",
+)
 COMBING_MODES: tuple[CombingMode, ...] = ("off", "all", "noskin", "infill")
 SUPPORT_TYPES: tuple[SupportType, ...] = ("buildplate", "everywhere")
 SUPPORT_STRUCTURES: tuple[SupportStructure, ...] = ("normal", "tree")
@@ -80,6 +88,7 @@ class SliceSettings:
     ironing_only_highest_layer: bool = True
     z_seam_type: SeamType = "user_specified"
     z_seam_position: SeamPosition = "backright"
+    orca_seam: OrcaSeam = "back"
     infill_pattern: str = "lightning"
     infill_sparse_density: float = 5.0
     retraction_combing: CombingMode = "noskin"
@@ -102,6 +111,7 @@ class SliceSettings:
             raise ValueError("infill_sparse_density must be between 0 and 100")
         _enum(self.z_seam_type, SEAM_TYPES, "z_seam_type")
         _enum(self.z_seam_position, SEAM_POSITIONS, "z_seam_position")
+        _enum(self.orca_seam, ORCA_SEAM_POSITIONS, "orca_seam")
         _enum(self.retraction_combing, COMBING_MODES, "retraction_combing")
         _enum(self.adhesion_type, ADHESION_TYPES, "adhesion_type")
         _enum(self.slicer_engine, SLICER_ENGINES, "slicer_engine")
@@ -121,6 +131,8 @@ class SliceSettings:
     def from_dict(data: dict[str, Any]) -> SliceSettings:
         known = {field: data[field] for field in SliceSettings.__dataclass_fields__ if field in data}
         settings = SliceSettings(**known)
+        if "orca_seam" not in data:
+            settings.orca_seam = _legacy_orca_seam(settings)
         settings.validate()
         return settings
 
@@ -191,6 +203,15 @@ _ORCA_SEAM = {
 }
 
 
+def _legacy_orca_seam(settings: SliceSettings) -> str:
+    """Map a Cura seam choice onto Orca when no Orca seam has been saved yet."""
+    if settings.z_seam_type == "random":
+        return "random"
+    if settings.z_seam_type == "user_specified":
+        return _ORCA_SEAM[settings.z_seam_position]
+    return "nearest"
+
+
 def orca_setting_overrides(settings: SliceSettings) -> dict[str, str]:
     """Shared settings written into an Orca process profile."""
     settings.validate()
@@ -200,16 +221,10 @@ def orca_setting_overrides(settings: SliceSettings) -> dict[str, str]:
         ironing = "top"
     else:
         ironing = "no ironing"
-    if settings.z_seam_type == "random":
-        seam = "random"
-    elif settings.z_seam_type == "user_specified":
-        seam = _ORCA_SEAM[settings.z_seam_position]
-    else:
-        seam = "nearest"
     values = {
         "layer_height": _number(settings.layer_height),
         "ironing_type": ironing,
-        "seam_position": seam,
+        "seam_position": settings.orca_seam,
         "sparse_infill_pattern": _ORCA_INFILL.get(settings.infill_pattern, settings.infill_pattern),
         "sparse_infill_density": f"{_number(settings.infill_sparse_density)}%",
         "reduce_crossing_wall": "0" if settings.retraction_combing == "off" else "1",

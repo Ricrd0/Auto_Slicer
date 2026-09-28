@@ -2,7 +2,7 @@
 
 Batch-slice every STL and 3MF in an input folder, once per printer, and write gcode under a shared folder name on each machine.
 
-Settings has a slicing engine choice. Cura uses CuraEngine 5.13 and the Cura machine profiles. Orca uses OrcaSlicer 2.4.2 and the machine profiles under `%APPDATA%\OrcaSlicer`. The same layer height, ironing, seam, infill, combing, adhesion, and support settings are applied to whichever engine is selected.
+Settings has a slicing engine choice. Cura uses CuraEngine 5.13 and the Cura machine profiles. Orca uses OrcaSlicer 2.4.2. The Printers tab lists the Orca profiles linked to the machines in your Cura configuration; "Show every Orca printer" reveals the full catalog so you can add another. Printer settings groups bed size, machine options, temperatures, speeds, and start/end scripts, and those values are applied when either engine slices. With Orca selected, a curated filament list supplies one nozzle and bed temperature for every printer unless that printer overrides them. Orca stores those temperatures on the filament profile.
 
 The web app calls the slicer directly. No language model is involved.
 

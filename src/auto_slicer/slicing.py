@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import json
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from auto_slicer.cura_config import PrinterProfile, active_config_dir
 from auto_slicer.engine import EngineError, build_slice_command, locate_cura, run_slice
 from auto_slicer.gcode import parse_gcode_header
+from auto_slicer.machine_sync import (
+    cura_machine_overrides,
+    orca_filament_overrides,
+    orca_process_extras,
+    patch_orca_machine,
+)
 from auto_slicer.meshio import load_model, transform_mesh, write_stl
 from auto_slicer.orca_config import (
     active_orca_dir,
@@ -71,9 +78,29 @@ def effective_rotation(settings: SliceSettings, pose: dict[str, Any] | None) -> 
 
 
 def saved_position(pose: dict[str, Any] | None) -> tuple[float, float] | None:
-    if not pose or not isinstance(pose.get("position"), list) or len(pose["position"]) != 2:
+    if not pose or not isinstance(pose.get("position"), list) or len(pose["position"]) < 2:
         return None
     return float(pose["position"][0]), float(pose["position"][1])
+
+
+def pose_z(pose: dict[str, Any] | None) -> float:
+    if not pose:
+        return 0.0
+    if pose.get("z") is not None:
+        return float(pose["z"])
+    position = pose.get("position")
+    if isinstance(position, list) and len(position) >= 3:
+        return float(position[2])
+    return 0.0
+
+
+def pose_scale(pose: dict[str, Any] | None) -> float:
+    if not pose or pose.get("scale") is None:
+        return 1.0
+    scale = float(pose["scale"])
+    if scale <= 0:
+        raise ValueError("scale must be positive")
+    return scale
 
 
 def layout_for_model(
@@ -83,7 +110,10 @@ def layout_for_model(
     settings: SliceSettings,
     pose: dict[str, Any] | None,
 ) -> Layout:
-    part = _footprint(input_dir, relative, effective_rotation(settings, pose))
+    part = replace(
+        _footprint(input_dir, relative, effective_rotation(settings, pose), pose_scale(pose)),
+        z=pose_z(pose),
+    )
     return place_single(
         part,
         float(printer.machine_width or 0),
@@ -101,7 +131,18 @@ def layout_for_group(
     poses: dict[str, dict[str, Any]],
     manual_layout: dict[str, Any] | None,
 ) -> Layout:
-    parts = [_footprint(input_dir, relative, effective_rotation(settings, poses.get(relative))) for relative in files]
+    parts = [
+        replace(
+            _footprint(
+                input_dir,
+                relative,
+                effective_rotation(settings, poses.get(relative)),
+                pose_scale(poses.get(relative)),
+            ),
+            z=pose_z(poses.get(relative)),
+        )
+        for relative in files
+    ]
     manual = None
     if isinstance(manual_layout, dict):
         manual = {name: (float(pos["x"]), float(pos["y"])) for name, pos in manual_layout.items()}
@@ -145,6 +186,8 @@ def prepare_slice(
             printer.machine_width,
             printer.machine_depth,
             orca_origin(settings),
+            z=item.z,
+            scale=item.scale,
         )
         destination = root / f"{len(meshes)}.stl"
         destination.write_bytes(write_stl(posed))
@@ -176,9 +219,10 @@ def run_prepared_slice(
     prepared: PreparedSlice,
     output: Path,
     on_progress: Any = None,
+    machine: dict[str, object] | None = None,
 ) -> tuple[int | None, float | None]:
     if settings.slicer_engine == "orca":
-        return _run_orca(printer, settings, prepared, output, on_progress)
+        return _run_orca(printer, settings, prepared, output, on_progress, machine)
     engine, resources, library_path = locate_cura(paths)
     if engine is None or resources is None:
         raise EngineError("CuraEngine was not found. Build the Docker image or set CURA_ENGINE and CURA_RESOURCES.")
@@ -190,6 +234,7 @@ def run_prepared_slice(
         output,
         active_config_dir(paths.cura_config_dir),
         resources,
+        cura_machine_overrides(machine) if machine else None,
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     code, tail = run_slice(command, library_path, on_progress)
@@ -206,6 +251,7 @@ def _run_orca(
     prepared: PreparedSlice,
     output: Path,
     on_progress: Any,
+    machine: dict[str, object] | None,
 ) -> tuple[int | None, float | None]:
     binary, library_path = locate_orca()
     if binary is None:
@@ -216,12 +262,27 @@ def _run_orca(
     root = Path(prepared.temp_dir.name)
     process_path = root / "process.json"
     assemble_path = root / "assemble.json"
-    write_process_profile(process_path, settings)
+    write_process_profile(process_path, settings, orca_process_extras(machine) if machine else None)
     write_assemble_list(assemble_path, prepared.meshes)
+    machine_path = Path(printer.definition_path) if printer.definition_path else None
+    if machine is not None and machine_path is not None and machine_path.is_file():
+        source = json.loads(machine_path.read_text(encoding="utf-8"))
+        patched = root / "machine.json"
+        patched.write_text(json.dumps(patch_orca_machine(source, machine), indent=2), encoding="utf-8")
+        printer = _printer_with_machine_path(printer, patched)
     filament = generic_pla(config_dir)
-    if filament is None:
-        filament = root / "filament.json"
-        write_filament_profile(filament)
+    filament_path = root / "filament.json"
+    if machine is not None:
+        write_filament_profile(
+            filament_path,
+            orca_filament_overrides(machine),
+            name=str(machine.get("filament_name") or "Generic PLA"),
+            inherits=str(machine.get("filament_inherits") or "fdm_filament_pla"),
+        )
+        filament = filament_path
+    elif filament is None:
+        write_filament_profile(filament_path)
+        filament = filament_path
     archive = root / "plate.3mf"
     command = build_orca_command(
         binary,
@@ -243,15 +304,21 @@ def _run_orca(
     return _header_from_file(output)
 
 
+def _printer_with_machine_path(printer: PrinterProfile, path: Path) -> PrinterProfile:
+    return replace(printer, definition_path=str(path))
+
+
 def _header_from_file(path: Path) -> tuple[int | None, float | None]:
     text = path.read_text(encoding="utf-8", errors="replace")
     return parse_gcode_header(text[:8000] + "\n" + text[-8000:])
 
 
-def _footprint(input_dir: Path, relative: str, rotation: tuple[float, float, float]) -> Footprint:
+def _footprint(
+    input_dir: Path, relative: str, rotation: tuple[float, float, float], scale: float = 1.0
+) -> Footprint:
     path = _model_path(input_dir, relative)
     triangles = load_model(path.name, path.read_bytes())
-    return footprint_of(relative, triangles, rotation)
+    return footprint_of(relative, triangles, rotation, scale)
 
 
 def _model_path(input_dir: Path, relative: str) -> Path:

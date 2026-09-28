@@ -10,8 +10,17 @@ from auto_slicer.browse import browse, gcode_root, model_root, public_locations,
 from auto_slicer.bundles import export_all, export_printer, import_bundle
 from auto_slicer.cura_config import active_config_dir
 from auto_slicer.engine import locate_cura
-from auto_slicer.orca_config import active_orca_dir, locate_orca
+from auto_slicer.orca_config import active_orca_dir, locate_orca, search_filaments
 from auto_slicer.gcode import gcode_info, layer_polylines
+from auto_slicer.machine_sync import (
+    GCODE_FLAVORS,
+    apply_save_scope,
+    machine_from_cura,
+    machine_from_orca,
+    normalize_filament,
+    normalize_owned,
+    owned_from_orca,
+)
 from auto_slicer.jobs import JobRunner
 from auto_slicer.paths import DataPaths, safe_relative, safe_segment
 from auto_slicer.placement import Layout
@@ -19,6 +28,7 @@ from auto_slicer.settings_schema import (
     ADHESION_TYPES,
     COMBING_MODES,
     INFILL_PATTERNS,
+    ORCA_SEAM_POSITIONS,
     SEAM_POSITIONS,
     SEAM_TYPES,
     SLICER_ENGINES,
@@ -77,11 +87,13 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
             "adhesion_types": ADHESION_TYPES,
             "seam_types": SEAM_TYPES,
             "seam_positions": SEAM_POSITIONS,
+            "orca_seam_positions": ORCA_SEAM_POSITIONS,
             "combing_modes": COMBING_MODES,
             "support_types": SUPPORT_TYPES,
             "support_structures": SUPPORT_STRUCTURES,
             "infill_patterns": INFILL_PATTERNS,
             "slicer_engines": SLICER_ENGINES,
+            "gcode_flavors": GCODE_FLAVORS,
         }
 
     @app.get("/api/settings")
@@ -98,11 +110,172 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
         return settings.to_dict()
 
     @app.get("/api/printers")
-    def get_printers() -> list[dict[str, object]]:
+    def get_printers(catalog: bool = False) -> list[dict[str, object]]:
         enabled = store.load_enabled()
         return [
-            printer.to_public_dict(enabled.get(printer.id, True)) for printer in runner.printers()
+            printer.to_public_dict(enabled.get(printer.id, True))
+            for printer in runner.printers(catalog=catalog)
         ]
+
+    @app.get("/api/owned")
+    def get_owned() -> dict[str, object]:
+        owned = runner.ensure_owned()
+        orca = runner._discovered("orca")
+        cura = runner._discovered("cura")
+        return {
+            "printers": _with_profile_names(owned, cura, orca),
+            "orca_profiles": [{"id": printer.id, "name": printer.name} for printer in orca],
+        }
+
+    @app.put("/api/owned")
+    def put_owned(payload: dict[str, object]) -> dict[str, object]:
+        try:
+            incoming = normalize_owned(payload)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        owned = runner.ensure_owned()
+        existing = next((item for item in owned if item["id"] == incoming["id"]), None)
+        try:
+            record = apply_save_scope(existing, incoming, str(payload.get("scope") or "both"))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        replaced = False
+        updated: list[dict[str, object]] = []
+        for item in owned:
+            if item["id"] == record["id"]:
+                updated.append(record)
+                replaced = True
+            else:
+                updated.append(item)
+        if not replaced:
+            updated.append(record)
+        store.save_owned(updated)
+        return record
+
+    @app.post("/api/owned")
+    def post_owned(payload: dict[str, object]) -> dict[str, object]:
+        orca_id = str(payload.get("orca_id") or "")
+        if not orca_id:
+            raise HTTPException(status_code=400, detail="orca_id is required")
+        catalog = runner._discovered("orca")
+        match = next((printer for printer in catalog if printer.id == orca_id), None)
+        if match is None or match.engine != "orca":
+            raise HTTPException(status_code=404, detail="Orca printer was not found")
+        owned = runner.ensure_owned()
+        record = owned_from_orca(match, owned)
+        if record not in owned:
+            owned.append(record)
+            store.save_owned(owned)
+        return record
+
+    @app.post("/api/owned/pull")
+    def pull_owned(payload: dict[str, object]) -> dict[str, object]:
+        engine = str(payload.get("engine") or "")
+        printer_id = str(payload.get("id") or "")
+        owned = runner.ensure_owned()
+        record = next((item for item in owned if item["id"] == printer_id), None)
+        if record is None:
+            raise HTTPException(status_code=404, detail="printer was not found")
+        settings = dict(record["settings"]) if isinstance(record.get("settings"), dict) else {}
+        if engine == "cura":
+            cura_id = record.get("cura_id")
+            printer = next((item for item in runner._discovered("cura") if item.id == cura_id), None)
+            if printer is None:
+                raise HTTPException(status_code=404, detail="Cura profile was not found")
+            pulled = machine_from_cura(printer)
+            pulled["orca_start_gcode"] = settings.get("orca_start_gcode", "")
+            pulled["orca_end_gcode"] = settings.get("orca_end_gcode", "")
+            pulled["temperature_override"] = settings.get("temperature_override", True)
+        elif engine == "orca":
+            orca_id = record.get("orca_id")
+            printer = next((item for item in runner._discovered("orca") if item.id == orca_id), None)
+            if printer is None:
+                raise HTTPException(status_code=404, detail="Orca profile was not found")
+            pulled = machine_from_orca(printer)
+            pulled["cura_start_gcode"] = settings.get("cura_start_gcode", "")
+            pulled["cura_end_gcode"] = settings.get("cura_end_gcode", "")
+            for key in (
+                "temperature_override",
+                "nozzle_temperature",
+                "nozzle_temperature_initial",
+                "bed_temperature",
+                "bed_temperature_initial",
+            ):
+                if key in settings:
+                    pulled[key] = settings[key]
+        else:
+            raise HTTPException(status_code=400, detail="engine must be cura or orca")
+        return {"settings": pulled}
+
+    @app.delete("/api/owned")
+    def delete_owned(printer_id: str) -> dict[str, bool]:
+        owned = [item for item in runner.ensure_owned() if item["id"] != printer_id]
+        store.save_owned(owned)
+        return {"ok": True}
+
+    @app.get("/api/filaments")
+    def get_filaments() -> dict[str, object]:
+        return _clean_filaments(store)
+
+    @app.get("/api/filaments/catalog")
+    def filament_catalog(q: str = "") -> list[dict[str, object]]:
+        return search_filaments(runner.filament_catalog(), q)
+
+    @app.post("/api/filaments")
+    def post_filament(payload: dict[str, object]) -> dict[str, object]:
+        orca_id = str(payload.get("orca_id") or "")
+        match = next((item for item in runner.filament_catalog() if item["id"] == orca_id), None)
+        if match is None:
+            raise HTTPException(status_code=404, detail="Orca filament was not found")
+        library = _clean_filaments(store)
+        filaments = list(library["filaments"])
+        existing = next((item for item in filaments if item.get("orca_name") == match["name"]), None)
+        if existing is not None:
+            return existing
+        record = normalize_filament(
+            {
+                "name": match["name"],
+                "orca_name": match["name"],
+                "nozzle_temperature": match["nozzle_temperature"],
+                "nozzle_temperature_initial": match["nozzle_temperature_initial"],
+                "bed_temperature": match["bed_temperature"],
+                "bed_temperature_initial": match["bed_temperature_initial"],
+            },
+            {str(item["id"]) for item in filaments},
+        )
+        filaments.append(record)
+        selected = library["selected_id"] or record["id"]
+        store.save_filaments({"selected_id": selected, "filaments": filaments})
+        return record
+
+    @app.put("/api/filaments")
+    def put_filament(payload: dict[str, object]) -> dict[str, object]:
+        library = _clean_filaments(store)
+        try:
+            record = normalize_filament(payload, {str(item["id"]) for item in library["filaments"]})
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        filaments = [record if item["id"] == record["id"] else item for item in library["filaments"]]
+        if not any(item["id"] == record["id"] for item in library["filaments"]):
+            filaments.append(record)
+        store.save_filaments({"selected_id": library["selected_id"], "filaments": filaments})
+        return record
+
+    @app.put("/api/filaments/selected")
+    def put_selected_filament(payload: dict[str, object]) -> dict[str, object]:
+        library = _clean_filaments(store)
+        selected = str(payload.get("id") or "")
+        if selected and not any(item["id"] == selected for item in library["filaments"]):
+            raise HTTPException(status_code=404, detail="filament was not found")
+        saved = store.save_filaments({"selected_id": selected or None, "filaments": library["filaments"]})
+        return saved
+
+    @app.delete("/api/filaments")
+    def delete_filament(filament_id: str) -> dict[str, object]:
+        library = _clean_filaments(store)
+        filaments = [item for item in library["filaments"] if item["id"] != filament_id]
+        selected = library["selected_id"] if library["selected_id"] != filament_id else None
+        return store.save_filaments({"selected_id": selected, "filaments": filaments})
 
     @app.put("/api/printers/enabled")
     def put_enabled(payload: dict[str, object]) -> dict[str, bool]:
@@ -199,10 +372,27 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
             position = payload.get("position")
             if position is None:
                 existing.pop("position", None)
-            elif isinstance(position, list) and len(position) == 2:
+            elif isinstance(position, list) and len(position) in (2, 3):
                 existing["position"] = [float(position[0]), float(position[1])]
+                if len(position) == 3:
+                    existing["z"] = float(position[2])
             else:
-                raise HTTPException(status_code=400, detail="position needs two numbers")
+                raise HTTPException(status_code=400, detail="position needs two or three numbers")
+        if "z" in payload:
+            height = payload.get("z")
+            if height is None:
+                existing.pop("z", None)
+            else:
+                existing["z"] = float(height)
+        if "scale" in payload:
+            scale = payload.get("scale")
+            if scale is None:
+                existing.pop("scale", None)
+            else:
+                value = float(scale)
+                if value <= 0:
+                    raise HTTPException(status_code=400, detail="scale must be positive")
+                existing["scale"] = value
         store.save_pose(relative, existing or None)
         return existing
 
@@ -368,6 +558,40 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
     return app
 
 
+def _clean_filaments(store: Store) -> dict[str, object]:
+    raw = store.load_filaments()
+    filaments: list[dict[str, object]] = []
+    for item in raw["filaments"]:
+        if not isinstance(item, dict):
+            continue
+        try:
+            filaments.append(normalize_filament(item))
+        except (TypeError, ValueError):
+            continue
+    selected = raw["selected_id"]
+    if not any(item["id"] == selected for item in filaments):
+        selected = None
+    return {"selected_id": selected, "filaments": filaments}
+
+
+def _with_profile_names(
+    owned: list[dict[str, object]],
+    cura: list,
+    orca: list,
+) -> list[dict[str, object]]:
+    cura_names = {printer.id: printer.name for printer in cura}
+    orca_names = {printer.id: printer.name for printer in orca}
+    rows: list[dict[str, object]] = []
+    for item in owned:
+        row = dict(item)
+        cura_id = item.get("cura_id")
+        orca_id = item.get("orca_id")
+        row["cura_name"] = cura_names.get(cura_id) if isinstance(cura_id, str) else None
+        row["orca_name"] = orca_names.get(orca_id) if isinstance(orca_id, str) else None
+        rows.append(row)
+    return rows
+
+
 def _find_printer(runner: JobRunner, printer_id: str):
     for printer in runner.printers():
         if printer.id == printer_id:
@@ -400,6 +624,8 @@ def _layout_dict(layout: Layout) -> dict[str, object]:
                 "max_y": item.max_y,
                 "size_z": item.size_z,
                 "rotation": list(item.rotation),
+                "z": item.z,
+                "scale": item.scale,
             }
             for item in layout.items
         ],

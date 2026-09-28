@@ -12,6 +12,8 @@ class Footprint:
     depth: float
     height: float
     rotation: tuple[float, float, float]
+    z: float = 0.0
+    scale: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -23,6 +25,8 @@ class PlacedPart:
     max_y: float
     size_z: float
     rotation: tuple[float, float, float]
+    z: float = 0.0
+    scale: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -35,26 +39,39 @@ class Layout:
 
 
 def rotated_bounds(
-    triangles: list[Triangle], rotation: tuple[float, float, float]
+    triangles: list[Triangle], rotation: tuple[float, float, float], scale: float = 1.0
 ) -> tuple[float, float, float, float, float, float]:
     if not triangles:
         raise ValueError("mesh is empty")
+    if scale <= 0:
+        raise ValueError("scale must be positive")
     rotated = [
-        tuple(rotate_xyz(vertex, rotation[0], rotation[1], rotation[2]) for vertex in tri)
+        tuple(
+            rotate_xyz(
+                (vertex[0] * scale, vertex[1] * scale, vertex[2] * scale),
+                rotation[0],
+                rotation[1],
+                rotation[2],
+            )
+            for vertex in tri
+        )
         for tri in triangles
     ]
     low, high = bounds(rotated)
     return low[0], low[1], low[2], high[0], high[1], high[2]
 
 
-def footprint_of(file: str, triangles: list[Triangle], rotation: tuple[float, float, float]) -> Footprint:
-    low_x, low_y, low_z, high_x, high_y, high_z = rotated_bounds(triangles, rotation)
+def footprint_of(
+    file: str, triangles: list[Triangle], rotation: tuple[float, float, float], scale: float = 1.0
+) -> Footprint:
+    low_x, low_y, low_z, high_x, high_y, high_z = rotated_bounds(triangles, rotation, scale)
     return Footprint(
         file=file,
         width=high_x - low_x,
         depth=high_y - low_y,
         height=high_z - low_z,
         rotation=rotation,
+        scale=scale,
     )
 
 
@@ -137,6 +154,8 @@ def _placed(part: Footprint, min_x: float, min_y: float) -> PlacedPart:
         max_y=min_y + part.depth,
         size_z=part.height,
         rotation=part.rotation,
+        z=part.z,
+        scale=part.scale,
     )
 
 

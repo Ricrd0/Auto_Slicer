@@ -36,6 +36,7 @@ def build_slice_command(
     output: Path,
     config_dir: Path,
     resources_dir: Path | None,
+    machine_overrides: list[tuple[str, str]] | None = None,
 ) -> list[str]:
     if printer.definition_path is None:
         raise EngineError(printer.error or "printer definition is missing")
@@ -56,11 +57,13 @@ def build_slice_command(
     ]
     command.extend(_setting_args(printer.global_settings))
     command.extend(_setting_args(overrides))
+    command.extend(_setting_args(machine_overrides or []))
     command.extend(["-e0", "-j", fdmextruder])
     if printer.extruder_definition_path:
         command.extend(["-j", printer.extruder_definition_path])
     command.extend(_setting_args(printer.extruder_settings))
     command.extend(_setting_args(overrides))
+    command.extend(_setting_args(machine_overrides or []))
     for mesh in meshes:
         command.extend(
             [
