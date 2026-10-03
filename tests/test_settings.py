@@ -13,11 +13,17 @@ def test_defaults_match_the_shop_profile() -> None:
     assert settings.z_seam_type == "user_specified"
     assert settings.z_seam_position == "backright"
     assert settings.orca_seam == "back"
+    assert settings.orca_scarf_joint == "external"
+    assert settings.orca_scarf_conditional is True
     assert settings.infill_pattern == "lightning"
     assert settings.infill_sparse_density == 5
     assert settings.retraction_combing == "noskin"
     assert settings.adhesion_type == "brim"
     assert settings.support_enable is False
+    assert settings.orca_arrange_spacing == 0
+    assert settings.orca_arrange_rotate is False
+    assert settings.orca_arrange_multicolor is True
+    assert settings.orca_arrange_align_y is True
 
 
 def test_shared_overrides_put_combing_seam_and_infill_last_among_themselves() -> None:

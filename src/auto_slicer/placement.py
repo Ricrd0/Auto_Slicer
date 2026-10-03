@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from auto_slicer.meshio import Triangle, bounds, rotate_xyz
 
@@ -104,6 +104,8 @@ def place_group(
         return Layout(bed_width, bed_depth, bed_height, (), "group has no models")
     if manual is None:
         placed, pack_error = shelf_pack(parts, bed_width, bed_depth, gap)
+        if pack_error is None:
+            placed = center_group(placed, bed_width, bed_depth)
         error = pack_error or _fit_error(placed, bed_width, bed_depth, bed_height, gap)
         return Layout(bed_width, bed_depth, bed_height, tuple(placed), error)
     placed = []
@@ -118,8 +120,37 @@ def place_group(
     if missing:
         error = "manual layout is missing " + ", ".join(missing)
     else:
+        # Keep relative spacing from arrange/manual edits, but centre the whole
+        # group on this printer's bed the same way a single STL is centred.
+        placed = center_group(placed, bed_width, bed_depth)
         error = _fit_error(placed, bed_width, bed_depth, bed_height, gap)
     return Layout(bed_width, bed_depth, bed_height, tuple(placed), error)
+
+
+def center_group(
+    placed: list[PlacedPart], bed_width: float, bed_depth: float
+) -> list[PlacedPart]:
+    """Translate placed parts so their combined footprint is bed-centred."""
+    if not placed:
+        return placed
+    min_x = min(part.min_x for part in placed)
+    min_y = min(part.min_y for part in placed)
+    max_x = max(part.max_x for part in placed)
+    max_y = max(part.max_y for part in placed)
+    dx = (bed_width - (max_x - min_x)) / 2.0 - min_x
+    dy = (bed_depth - (max_y - min_y)) / 2.0 - min_y
+    if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+        return placed
+    return [
+        replace(
+            part,
+            min_x=part.min_x + dx,
+            min_y=part.min_y + dy,
+            max_x=part.max_x + dx,
+            max_y=part.max_y + dy,
+        )
+        for part in placed
+    ]
 
 
 def shelf_pack(

@@ -37,32 +37,59 @@ def write_stl(triangles: list[Triangle]) -> bytes:
 
 
 def read_3mf(data: bytes) -> list[Triangle]:
-    with zipfile.ZipFile(io.BytesIO(data)) as archive:
-        model_name = _find_model(archive)
-        root = ElementTree.fromstring(archive.read(model_name))
-    unit = _attr(root, "unit") or "millimeter"
-    scale = _UNIT_TO_MM.get(unit)
-    if scale is None:
-        raise ValueError(f"unsupported 3MF unit: {unit}")
-    objects = _mesh_objects(root)
-    triangles: list[Triangle] = []
-    build = _child(root, "build")
-    items = _children(build, "item") if build is not None else []
-    if not items:
-        for mesh in objects.values():
-            triangles.extend(_scale_mesh(mesh, scale))
-        if not triangles:
-            raise ValueError("3MF file does not contain a mesh")
-        return triangles
-    for item in items:
-        object_id = _attr(item, "objectid")
-        if object_id is None:
-            continue
-        transform = _parse_transform(_attr(item, "transform"))
-        triangles.extend(_object_triangles(object_id, objects, root, scale, transform, set()))
+    parts = read_3mf_parts(data)
+    triangles = [tri for _name, mesh in parts for tri in mesh]
     if not triangles:
         raise ValueError("3MF file does not contain a mesh")
     return triangles
+
+
+def read_3mf_parts(data: bytes) -> list[tuple[str, list[Triangle]]]:
+    """Return named build items with transforms applied, as separate parts."""
+    return [(name, mesh) for name, mesh, _transform in read_3mf_placements(data)]
+
+
+def read_3mf_placements(data: bytes) -> list[tuple[str, list[Triangle], tuple[float, ...]]]:
+    """Return named build items with applied meshes and their item transforms."""
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        model_name = _find_model(archive)
+        root = ElementTree.fromstring(archive.read(model_name))
+        unit = _attr(root, "unit") or "millimeter"
+        scale = _UNIT_TO_MM.get(unit)
+        if scale is None:
+            raise ValueError(f"unsupported 3MF unit: {unit}")
+        names = _object_names(archive)
+        objects = _mesh_objects_from_archive(archive, root, model_name)
+        build = _child(root, "build")
+        items = _children(build, "item") if build is not None else []
+        identity = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0)
+        if not items:
+            parts = [
+                (names.get(object_id, f"object_{object_id}"), _scale_mesh(mesh, scale), identity)
+                for object_id, mesh in objects.items()
+            ]
+            if not parts:
+                raise ValueError("3MF file does not contain a mesh")
+            return parts
+        parts: list[tuple[str, list[Triangle], tuple[float, ...]]] = []
+        for index, item in enumerate(items):
+            object_id = _attr(item, "objectid")
+            if object_id is None:
+                continue
+            transform = _parse_transform(_attr(item, "transform"))
+            mesh = _object_triangles(object_id, objects, root, scale, transform, set(), archive)
+            if not mesh:
+                continue
+            parts.append((names.get(object_id, f"object_{index + 1}"), mesh, transform))
+        if not parts:
+            raise ValueError("3MF file does not contain a mesh")
+        return parts
+
+
+def transform_z_degrees(transform: tuple[float, ...]) -> float:
+    """Extract the Z-axis rotation (degrees) from a 3MF 3x4 transform."""
+    m00, _m01, _m02, m10, *_rest = transform
+    return math.degrees(math.atan2(m10, m00))
 
 
 def bounds(triangles: list[Triangle]) -> tuple[Vertex, Vertex]:
@@ -262,20 +289,75 @@ def _mesh_objects(root: ElementTree.Element) -> dict[str, list[Triangle]]:
         mesh = _child(obj, "mesh")
         if object_id is None or mesh is None:
             continue
-        vertices_el = _child(mesh, "vertices")
-        triangles_el = _child(mesh, "triangles")
-        if vertices_el is None or triangles_el is None:
-            continue
-        vertices = [
-            (float(_attr(vertex, "x") or 0), float(_attr(vertex, "y") or 0), float(_attr(vertex, "z") or 0))
-            for vertex in _children(vertices_el, "vertex")
-        ]
-        triangles: list[Triangle] = []
-        for tri in _children(triangles_el, "triangle"):
-            indexes = [int(_attr(tri, key) or 0) for key in ("v1", "v2", "v3")]
-            triangles.append((vertices[indexes[0]], vertices[indexes[1]], vertices[indexes[2]]))
-        objects[object_id] = triangles
+        parsed = _mesh_from_element(mesh)
+        if parsed:
+            objects[object_id] = parsed
     return objects
+
+
+def _mesh_objects_from_archive(
+    archive: zipfile.ZipFile, root: ElementTree.Element, model_name: str
+) -> dict[str, list[Triangle]]:
+    objects = _mesh_objects(root)
+    for name in archive.namelist():
+        if not name.lower().endswith(".model"):
+            continue
+        if name == model_name:
+            continue
+        try:
+            nested = ElementTree.fromstring(archive.read(name))
+        except ElementTree.ParseError:
+            continue
+        for object_id, mesh in _mesh_objects(nested).items():
+            objects.setdefault(object_id, mesh)
+    return objects
+
+
+def _mesh_from_element(mesh: ElementTree.Element) -> list[Triangle]:
+    vertices_el = _child(mesh, "vertices")
+    triangles_el = _child(mesh, "triangles")
+    if vertices_el is None or triangles_el is None:
+        return []
+    vertices = [
+        (float(_attr(vertex, "x") or 0), float(_attr(vertex, "y") or 0), float(_attr(vertex, "z") or 0))
+        for vertex in _children(vertices_el, "vertex")
+    ]
+    triangles: list[Triangle] = []
+    for tri in _children(triangles_el, "triangle"):
+        indexes = [int(_attr(tri, key) or 0) for key in ("v1", "v2", "v3")]
+        triangles.append((vertices[indexes[0]], vertices[indexes[1]], vertices[indexes[2]]))
+    return triangles
+
+
+def _object_names(archive: zipfile.ZipFile) -> dict[str, str]:
+    names: dict[str, str] = {}
+    if "Metadata/model_settings.config" not in archive.namelist():
+        return names
+    try:
+        root = ElementTree.fromstring(archive.read("Metadata/model_settings.config"))
+    except ElementTree.ParseError:
+        return names
+    for obj in root.iter():
+        if _local(obj.tag) != "object":
+            continue
+        object_id = obj.attrib.get("id")
+        if not object_id:
+            continue
+        label = None
+        for child in list(obj):
+            if _local(child.tag) == "metadata" and child.attrib.get("key") == "name":
+                label = child.attrib.get("value")
+                break
+            if _local(child.tag) == "part":
+                for meta in list(child):
+                    if _local(meta.tag) == "metadata" and meta.attrib.get("key") in {
+                        "source_file",
+                        "name",
+                    }:
+                        label = meta.attrib.get("value") or label
+        if label:
+            names[object_id] = label
+    return names
 
 
 def _object_triangles(
@@ -285,6 +367,7 @@ def _object_triangles(
     scale: float,
     transform: tuple[float, ...],
     stack: set[str],
+    archive: zipfile.ZipFile | None = None,
 ) -> list[Triangle]:
     if object_id in stack:
         raise ValueError("3MF component cycle")
@@ -308,11 +391,27 @@ def _object_triangles(
                 child_id = _attr(component, "objectid")
                 if child_id is None:
                     continue
+                child_root = root
+                child_objects = objects
+                path = _attr(component, "path")
+                if path and archive is not None:
+                    nested_name = path.lstrip("/")
+                    if nested_name in archive.namelist():
+                        child_root = ElementTree.fromstring(archive.read(nested_name))
+                        child_objects = {**objects, **_mesh_objects(child_root)}
                 child_transform = _multiply(
                     transform, _parse_transform(_attr(component, "transform"))
                 )
                 collected.extend(
-                    _object_triangles(child_id, objects, root, scale, child_transform, stack)
+                    _object_triangles(
+                        child_id,
+                        child_objects,
+                        child_root,
+                        scale,
+                        child_transform,
+                        stack,
+                        archive,
+                    )
                 )
         finally:
             stack.remove(object_id)

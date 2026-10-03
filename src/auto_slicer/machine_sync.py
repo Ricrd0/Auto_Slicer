@@ -6,8 +6,10 @@ from dataclasses import replace
 from pathlib import Path
 
 from auto_slicer.cura_config import PrinterProfile
+from auto_slicer.orca_config import apply_user_orca_machine_override, user_orca_machine_override
 
 GCODE_FLAVORS: tuple[str, ...] = ("Marlin", "RepRap", "Klipper", "UltiGCode")
+Z_HOP_TYPES: tuple[str, ...] = ("Normal Lift", "Slope Lift", "Spiral Lift", "Auto Lift")
 
 _NUMBER_FIELDS = (
     "bed_width",
@@ -62,6 +64,7 @@ def default_machine() -> dict[str, object]:
         "retraction_length": 5.0,
         "retraction_speed": 45.0,
         "z_hop": 0.2,
+        "z_hop_type": "Normal Lift",
         "travel_speed": 150.0,
         "temperature_override": False,
         "nozzle_temperature": 200.0,
@@ -91,12 +94,17 @@ def normalize_machine(data: object) -> dict[str, object]:
         merged["bed_temperature_initial"] = merged["bed_temperature"]
     if "gcode_flavor" in raw and raw["gcode_flavor"] not in (None, ""):
         merged["gcode_flavor"] = str(raw["gcode_flavor"])
+    if "z_hop_type" in raw and raw["z_hop_type"] not in (None, ""):
+        merged["z_hop_type"] = str(raw["z_hop_type"])
     for key in _SCRIPT_FIELDS:
         if key in raw and raw[key] is not None:
             merged[key] = str(raw[key])
     flavor = str(merged["gcode_flavor"])
     if flavor not in GCODE_FLAVORS:
         raise ValueError(f"gcode_flavor must be one of {', '.join(GCODE_FLAVORS)}")
+    hop_type = str(merged["z_hop_type"])
+    if hop_type not in Z_HOP_TYPES:
+        raise ValueError(f"z_hop_type must be one of {', '.join(Z_HOP_TYPES)}")
     for key in ("bed_width", "bed_depth", "bed_height", "nozzle_diameter"):
         if float(merged[key]) <= 0:
             raise ValueError(f"{key} must be positive")
@@ -229,6 +237,8 @@ def machine_from_orca(printer: PrinterProfile) -> dict[str, object]:
             loaded = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(loaded, dict):
                 data = loaded
+    config_root = Path(printer.config_root) if printer.config_root else None
+    data = apply_user_orca_machine_override(data, config_root)
     machine = default_machine()
     if printer.machine_width is not None:
         machine["bed_width"] = printer.machine_width
@@ -250,6 +260,11 @@ def machine_from_orca(printer: PrinterProfile) -> dict[str, object]:
     hop = _first_number(data.get("z_hop"))
     if hop is not None:
         machine["z_hop"] = hop
+    hop_type = data.get("z_hop_types")
+    if isinstance(hop_type, list) and hop_type:
+        hop_type = hop_type[0]
+    if isinstance(hop_type, str) and hop_type in Z_HOP_TYPES:
+        machine["z_hop_type"] = hop_type
     flavor = str(data.get("gcode_flavor") or "").lower()
     by_name = {item.lower(): item for item in GCODE_FLAVORS}
     if flavor in by_name:
@@ -281,6 +296,7 @@ def merge_owned(
             orca_settings = machine_from_orca(match)
             settings["orca_start_gcode"] = orca_settings["orca_start_gcode"]
             settings["orca_end_gcode"] = orca_settings["orca_end_gcode"]
+            settings["gcode_flavor"] = orca_settings["gcode_flavor"]
         current.append(
             normalize_owned(
                 {
@@ -293,6 +309,48 @@ def merge_owned(
             )
         )
     return current
+
+
+def sync_owned_with_orca_user_profiles(
+    owned: list[dict[str, object]], config_dir: Path | None
+) -> list[dict[str, object]]:
+    """Heal owned Marlin flavor when the user's Orca preset is Klipper.
+
+    Cura seeds owned printers as Marlin. Many Orca users keep a
+    ``… - Klipper`` preset that inherits the system nozzle profile; without
+    adopting that flavor, Orca CLI validation fails with exit -51.
+    """
+    if config_dir is None:
+        return owned
+    updated: list[dict[str, object]] = []
+    for record in owned:
+        item = dict(record)
+        orca_id = item.get("orca_id")
+        if not orca_id:
+            updated.append(item)
+            continue
+        base_name = str(orca_id).removeprefix("orca:")
+        override = user_orca_machine_override(config_dir, base_name)
+        if override is None or str(override.get("gcode_flavor") or "").lower() != "klipper":
+            updated.append(item)
+            continue
+        changed = False
+        for key in ("settings", "orca_settings"):
+            settings = item.get(key)
+            if not isinstance(settings, dict):
+                continue
+            if settings.get("gcode_flavor") != "Marlin":
+                continue
+            healed = dict(settings)
+            healed["gcode_flavor"] = "Klipper"
+            if not healed.get("orca_start_gcode") and override.get("machine_start_gcode"):
+                healed["orca_start_gcode"] = str(override["machine_start_gcode"])
+            if not healed.get("orca_end_gcode") and override.get("machine_end_gcode"):
+                healed["orca_end_gcode"] = str(override["machine_end_gcode"])
+            item[key] = normalize_machine(healed)
+            changed = True
+        updated.append(normalize_owned(item) if changed else item)
+    return updated
 
 
 def owned_from_orca(printer: PrinterProfile, existing: list[dict[str, object]]) -> dict[str, object]:
@@ -352,6 +410,7 @@ def cura_machine_overrides(machine: dict[str, object]) -> list[tuple[str, str]]:
         ("retraction_amount", _num(float(machine["retraction_length"]))),
         ("retraction_speed", _num(float(machine["retraction_speed"]))),
         ("retraction_hop", _num(float(machine["z_hop"]))),
+        ("retraction_hop_enabled", "true" if float(machine["z_hop"]) > 0 else "false"),
         ("speed_travel", _num(float(machine["travel_speed"]))),
         ("material_print_temperature", nozzle),
         ("material_print_temperature_layer_0", nozzle_initial),
@@ -381,6 +440,7 @@ def patch_orca_machine(data: dict[str, object], machine: dict[str, object]) -> d
     patched["retraction_speed"] = [_num(float(machine["retraction_speed"]))]
     patched["deretraction_speed"] = [_num(float(machine["retraction_speed"]))]
     patched["z_hop"] = [_num(float(machine["z_hop"]))]
+    patched["z_hop_types"] = [str(machine["z_hop_type"])]
     if machine["orca_start_gcode"]:
         patched["machine_start_gcode"] = machine["orca_start_gcode"]
     if machine["orca_end_gcode"]:
@@ -441,9 +501,12 @@ def orca_filament_overrides(machine: dict[str, object]) -> dict[str, list[str]]:
     bed_initial = "0" if not machine["heated_bed"] else _num(float(machine["bed_temperature_initial"]))
     nozzle = _num(float(machine["nozzle_temperature"]))
     nozzle_initial = _num(float(machine["nozzle_temperature_initial"]))
+    hop = _num(float(machine["z_hop"]))
     values = {
         "nozzle_temperature": [nozzle],
         "nozzle_temperature_initial_layer": [nozzle_initial],
+        "filament_z_hop": [hop],
+        "filament_z_hop_types": [str(machine["z_hop_type"])],
     }
     for plate in ("cool_plate", "eng_plate", "hot_plate", "textured_plate"):
         values[f"{plate}_temp"] = [bed]

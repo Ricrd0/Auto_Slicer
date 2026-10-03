@@ -13,12 +13,13 @@ from auto_slicer.machine_sync import (
     machine_for_engine,
     merge_owned,
     owned_for_printer,
+    sync_owned_with_orca_user_profiles,
     with_synced_bed,
 )
 from auto_slicer.orca_config import active_orca_dir, discover_filaments, discover_orca_printers
 from auto_slicer.paths import safe_segment
 from auto_slicer.slicing import (
-    layout_for_group,
+    ensure_group_layout,
     layout_for_model,
     list_models,
     output_group_path,
@@ -48,6 +49,7 @@ class JobRunner:
     def ensure_owned(self) -> list[dict[str, Any]]:
         existing = self.store.load_owned()
         merged = merge_owned(existing, self._discovered("cura"), self._discovered("orca"))
+        merged = sync_owned_with_orca_user_profiles(merged, active_orca_dir())
         if merged != existing:
             self.store.save_owned(merged)
         return merged
@@ -103,12 +105,18 @@ class JobRunner:
             printers = [printer for printer in self.printers() if self._included(printer, printer_id)]
             if not printers:
                 raise ValueError("no enabled printer is available")
-            models = list_models(model_root(self.store))
+            groups_all = self.store.load_groups()
+            arranged = {str(group["arranged_3mf"]) for group in groups_all if group.get("arranged_3mf")}
+            models = [
+                model
+                for model in list_models(model_root(self.store))
+                if str(model["path"]) not in arranged
+            ]
             included = self.store.load_locations().get("included")
-            if included is not None and selection is None:
-                chosen = {str(item) for item in included}
+            if selection is None:
+                chosen = {str(item) for item in included} if isinstance(included, list) else set()
                 models = [model for model in models if str(model["path"]) in chosen]
-            groups = [group for group in self.store.load_groups() if group.get("files")]
+            groups = [group for group in groups_all if group.get("files")]
             if selection is not None:
                 item_type, item_name = selection
                 if item_type == "model":
@@ -122,7 +130,7 @@ class JobRunner:
                     if not groups:
                         raise ValueError("selected group was not found")
             if not models and not groups:
-                raise ValueError("there are no models to slice")
+                raise ValueError("there are no models or groups to slice")
             job_id = self.store.create_job(kind, folder)
             names = _printer_directories(printers)
             group_labels = _group_labels(groups)
@@ -187,14 +195,16 @@ class JobRunner:
                     )
                 else:
                     group = groups[item_key]
-                    layout = layout_for_group(
+                    layout, dirty = ensure_group_layout(
                         model_root(self.store),
-                        list(group["files"]),
+                        group,
                         printer,
                         settings,
                         poses,
-                        group.get("manual_layout"),
+                        machine if isinstance(machine, dict) else None,
                     )
+                    if dirty:
+                        self.store.save_groups(list(groups.values()))
                 prepared = prepare_slice(model_root(self.store), printer, layout, settings)
                 output = gcode_root(self.store) / output_rel
 

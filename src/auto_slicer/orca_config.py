@@ -65,6 +65,62 @@ def discover_orca_printers(config_dir: Path | None) -> list[PrinterProfile]:
     return [found[name] for name in sorted(found)]
 
 
+def user_orca_machine_override(config_dir: Path | None, base_name: str) -> dict[str, object] | None:
+    """Return a user machine preset that inherits ``base_name``, if present.
+
+    Orca keeps system nozzle profiles (often Marlin) and stores the user's
+    customized Klipper/start-gcode copy under a separate name that inherits
+    the system machine. Slice/arrange should prefer that override.
+    """
+    if config_dir is None or not base_name:
+        return None
+    matches: list[tuple[int, dict[str, object]]] = []
+    for path in _machine_jsons(config_dir / "user"):
+        data = _read_json(path)
+        if data is None or not _is_true(data.get("instantiation", "true")):
+            continue
+        if str(data.get("inherits") or "") != base_name:
+            continue
+        name = str(data.get("name") or path.stem).lower()
+        score = 20
+        if "klipper" in name:
+            score += 50
+        if "0.4" in name:
+            score += 5
+        matches.append((score, data))
+    if not matches:
+        return None
+    matches.sort(key=lambda item: item[0], reverse=True)
+    return dict(matches[0][1])
+
+
+def apply_user_orca_machine_override(
+    source: dict[str, object], config_dir: Path | None
+) -> dict[str, object]:
+    """Overlay a matching user preset onto a system machine definition."""
+    base_name = str(source.get("name") or "")
+    override = user_orca_machine_override(config_dir, base_name)
+    if override is None:
+        return dict(source)
+    merged = dict(source)
+    for key, value in override.items():
+        if key in {
+            "type",
+            "name",
+            "inherits",
+            "from",
+            "instantiation",
+            "setting_id",
+            "compatible_prints",
+            "compatible_printers",
+        }:
+            continue
+        if value is None or value == "":
+            continue
+        merged[key] = value
+    return merged
+
+
 def generic_pla(config_dir: Path) -> Path | None:
     for path in config_dir.glob("system/*/filament/Generic PLA @System.json"):
         if path.is_file():
@@ -79,17 +135,22 @@ def write_process_profile(
     path: Path,
     settings: SliceSettings,
     extra: dict[str, str] | None = None,
+    *,
+    inherits: str | None = None,
+    compatible_printers: list[str] | None = None,
 ) -> None:
-    profile = {
+    profile: dict[str, object] = {
         "type": "process",
         "name": "Auto Slicer",
-        "inherits": "fdm_process_common",
+        "inherits": inherits or "fdm_process_common",
         "from": "user",
         "instantiation": "true",
     }
     profile.update(orca_setting_overrides(settings))
     if extra:
         profile.update(extra)
+    if compatible_printers:
+        profile["compatible_printers"] = compatible_printers
     path.write_text(json.dumps(profile, indent=2), encoding="utf-8")
 
 
@@ -99,6 +160,7 @@ def write_filament_profile(
     *,
     name: str = "Generic PLA",
     inherits: str = "fdm_filament_pla",
+    compatible_printers: list[str] | None = None,
 ) -> None:
     profile: dict[str, object] = {
         "type": "filament",
@@ -109,7 +171,22 @@ def write_filament_profile(
     }
     if extra:
         profile.update(extra)
+    if compatible_printers:
+        profile["compatible_printers"] = compatible_printers
     path.write_text(json.dumps(profile, indent=2), encoding="utf-8")
+
+
+def process_inherits_for_machine(machine_json: dict[str, object] | None) -> str | None:
+    """Prefer the machine's default print profile so temporary process JSON can inherit."""
+    if not machine_json:
+        return None
+    profile = machine_json.get("default_print_profile")
+    if isinstance(profile, str) and profile.strip():
+        return profile.strip()
+    if isinstance(profile, list) and profile:
+        value = str(profile[0]).strip()
+        return value or None
+    return None
 
 
 def discover_filaments(config_dir: Path | None) -> list[dict[str, object]]:
@@ -167,7 +244,9 @@ def write_assemble_list(path: Path, meshes: list[Path]) -> None:
     """Place already-positioned meshes with a zero translation.
 
     ``prepare_slice`` writes Orca meshes in front-left bed coordinates, and
-    Orca adds ``pos_*`` on top of those vertices.
+    Orca adds ``pos_*`` on top of those vertices. Parts stay separate: we never
+    set ``assemble_index`` (values greater than 0 would merge objects) and the
+    CLI never receives ``--assemble``.
     """
     document = {
         "plates": [
@@ -220,8 +299,44 @@ def build_orca_command(
         "--export-3mf",
         str(output_3mf),
         "--min-save",
-        "1",
     ]
+
+
+def build_orca_arrange_command(
+    binary: Path,
+    printer: PrinterProfile,
+    meshes: list[Path],
+    output_3mf: Path,
+    config_dir: Path,
+    process_path: Path,
+    filament_path: Path,
+    settings: SliceSettings,
+) -> list[str]:
+    """Arrange separate STLs onto one plate and export a full project 3MF.
+
+    Intentionally omits ``--assemble`` so parts remain individual objects, and
+    omits ``--min-save`` so transforms and meshes are kept for reuse.
+    """
+    if printer.definition_path is None:
+        raise EngineError(printer.error or "Orca machine profile is missing")
+    if not meshes:
+        raise EngineError("there is no mesh to arrange")
+    command = [
+        str(binary),
+        "--datadir",
+        str(config_dir),
+        "--load-settings",
+        f"{process_path};{printer.definition_path}",
+        "--load-filaments",
+        str(filament_path),
+        "--arrange=1",
+        f"--allow-rotations={'1' if settings.orca_arrange_rotate else '0'}",
+        f"--allow-multicolor-oneplate={'1' if settings.orca_arrange_multicolor else '0'}",
+        "--export-3mf",
+        str(output_3mf),
+    ]
+    command.extend(str(mesh) for mesh in meshes)
+    return command
 
 
 def extract_plate_gcode(archive_path: Path, destination: Path) -> None:

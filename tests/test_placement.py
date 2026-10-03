@@ -36,8 +36,10 @@ def test_shelf_pack_leaves_a_gap_and_manual_positions_can_overlap() -> None:
     packed = place_group([first, second], 100, 100, 50, gap=5, manual=None)
     assert packed.error is None
     by_file = {item.file: item for item in packed.items}
-    assert by_file["a.stl"].min_x == 0
-    assert by_file["b.stl"].min_x == 15
+    # Packed at the origin, then the whole group is centred on the bed.
+    assert by_file["a.stl"].min_x == 37.5
+    assert by_file["b.stl"].min_x == 52.5
+    assert by_file["a.stl"].min_y == 45.0
 
     manual = place_group(
         [first, second],
@@ -64,5 +66,23 @@ def test_manual_layout_is_used_instead_of_the_shelf() -> None:
     )
     assert layout.error is None
     by_file = {item.file: item for item in layout.items}
-    assert (by_file["a.stl"].min_x, by_file["a.stl"].min_y) == (30, 40)
-    assert by_file["b.stl"].min_x == 80
+    # Relative spacing from the manual layout is kept; the group is centred.
+    assert by_file["b.stl"].min_x - by_file["a.stl"].min_x == 50
+    assert by_file["a.stl"].min_y == by_file["b.stl"].min_y
+    assert by_file["a.stl"].min_x == 80.0
+    assert by_file["a.stl"].min_y == 105.0
+
+
+def test_group_is_recentered_for_each_bed_size() -> None:
+    first = footprint_of(*_part("a.stl", 20, 10), (0, 0, 0))
+    second = footprint_of(*_part("b.stl", 20, 10), (0, 0, 0))
+    manual = {"a.stl": (100.0, 20.0), "b.stl": (130.0, 20.0)}
+    small = place_group([first, second], 220, 220, 250, gap=0, manual=manual)
+    large = place_group([first, second], 300, 300, 250, gap=0, manual=manual)
+    assert small.error is None and large.error is None
+    small_items = {item.file: item for item in small.items}
+    large_items = {item.file: item for item in large.items}
+    assert small_items["a.stl"].min_x == 85.0
+    assert large_items["a.stl"].min_x == 125.0
+    assert small_items["b.stl"].min_x - small_items["a.stl"].min_x == 30.0
+    assert large_items["b.stl"].min_x - large_items["a.stl"].min_x == 30.0

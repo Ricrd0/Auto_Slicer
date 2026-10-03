@@ -39,7 +39,12 @@ const state = {
   mode: "orbit",
   drag: null,
   gcodePath: null,
+  gcodeLabel: null,
+  gcodeBed: null,
   gcodeLayers: 0,
+  gcodeFramed: false,
+  gcodeDrag: null,
+  gcodeLayerRequest: 0,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -136,6 +141,12 @@ const bed = new LineLoop(
   new LineBasicMaterial({ color: 0xf4e1c1 }),
 );
 preview.scene.add(bed);
+const gcodeBed = new LineLoop(
+  new BufferGeometry(),
+  new LineBasicMaterial({ color: 0xf4e1c1 }),
+);
+gcodeBed.userData.bed = true;
+gcodeView.scene.add(gcodeBed);
 const partMaterial = new MeshStandardMaterial({ color: 0xc4a484, roughness: 0.7, metalness: 0.0, side: DoubleSide });
 const selectedMaterial = new MeshStandardMaterial({ color: 0xe7c8a0, roughness: 0.55, metalness: 0.0, side: DoubleSide });
 
@@ -233,6 +244,13 @@ async function showLayout() {
     setBed(layout.bed_width, layout.bed_depth);
     state.layoutItems = layout.items;
     if (layout.error) error.textContent = layout.error;
+    if (kind === "group") {
+      const group = state.groups.find((entry) => entry.id === body.group_id);
+      if (group) {
+        if (layout.manual_layout) group.manual_layout = layout.manual_layout;
+        if (layout.arranged_3mf !== undefined) group.arranged_3mf = layout.arranged_3mf;
+      }
+    }
     for (const item of layout.items) {
       const positions = await loadMesh(item.file);
       const geometry = geometryFromPositions(positions, item.rotation, item.scale || 1);
@@ -470,7 +488,13 @@ function bindPreviewPointer() {
 
 function field(name, label, type, extra = {}) {
   const wrap = document.createElement("label");
-  wrap.textContent = label;
+  wrap.dataset.field = name;
+  const title = document.createElement("span");
+  title.textContent = label;
+  if (extra.tip) {
+    wrap.title = extra.tip;
+    title.title = extra.tip;
+  }
   const input = document.createElement(type === "select" ? "select" : "input");
   if (type !== "select") input.type = type;
   input.name = name;
@@ -484,70 +508,176 @@ function field(name, label, type, extra = {}) {
       input.append(node);
     }
   }
-  wrap.append(input);
+  wrap.append(title, input);
   return wrap;
 }
 
-function seamSpecs(options) {
-  if ((state.settings?.slicer_engine || "cura") === "orca") {
-    return [[
-      "orca_seam",
-      "Seam",
-      "select",
-      {
-        options: options.orca_seam_positions,
-        labels: {
-          nearest: "Nearest",
-          aligned: "Aligned",
-          aligned_back: "Aligned back",
-          back: "Back",
-          random: "Random",
-        },
-      },
-    ]];
+function settingsSection(title, tip = "") {
+  const section = document.createElement("section");
+  section.className = "settings-section";
+  const heading = document.createElement("h3");
+  heading.textContent = title;
+  if (tip) heading.title = tip;
+  section.append(heading);
+  if (tip) {
+    const hint = document.createElement("p");
+    hint.className = "settings-hint";
+    hint.textContent = tip;
+    section.append(hint);
   }
-  return [
-    ["z_seam_type", "Seam", "select", { options: options.seam_types }],
-    ["z_seam_position", "Seam position", "select", { options: options.seam_positions }],
-  ];
+  const grid = document.createElement("div");
+  grid.className = "grid";
+  section.append(grid);
+  return { section, grid };
+}
+
+function appendFields(host, specs) {
+  for (const [name, label, type, extra] of specs) {
+    host.append(field(name, label, type, extra || {}));
+  }
+}
+
+function syncSettingsVisibility() {
+  const form = $("settings-form");
+  if (!form) return;
+  const engine = form.querySelector('[name="slicer_engine"]')?.value || state.settings?.slicer_engine || "cura";
+  const ironing = form.querySelector('[name="ironing_enabled"]')?.checked;
+  const adhesion = form.querySelector('[name="adhesion_type"]')?.value || "none";
+  const supports = form.querySelector('[name="support_enable"]')?.checked;
+  const seamType = form.querySelector('[name="z_seam_type"]')?.value;
+  const scarf = form.querySelector('[name="orca_scarf_joint"]')?.value;
+  const show = (selector, visible) => {
+    for (const node of form.querySelectorAll(selector)) node.hidden = !visible;
+  };
+  show('[data-cluster="ironing-options"]', Boolean(ironing));
+  show('[data-cluster="cura-seam"]', engine === "cura");
+  show('[data-cluster="cura-seam-position"]', engine === "cura" && seamType === "user_specified");
+  show('[data-cluster="orca-seam"]', engine === "orca");
+  show('[data-cluster="orca-scarf"]', engine === "orca");
+  show('[data-cluster="orca-scarf-conditional"]', engine === "orca" && scarf && scarf !== "none");
+  show('[data-cluster="orca-arrange"]', engine === "orca");
+  show('[data-cluster="brim"]', adhesion === "brim");
+  show('[data-cluster="skirt"]', adhesion === "skirt");
+  show('[data-cluster="raft"]', adhesion === "raft");
+  show('[data-cluster="supports"]', Boolean(supports));
 }
 
 function renderSettings() {
   const form = $("settings-form");
   const options = state.options;
-  const specs = [
-    ["slicer_engine", "Slicing engine", "select", { options: options.slicer_engines, labels: { cura: "Cura", orca: "Orca" } }],
-    ["output_folder_name", "Output folder name", "text"],
-    ["rotation_x", "Shared rotation X", "number", { step: "1" }],
-    ["rotation_y", "Shared rotation Y", "number", { step: "1" }],
-    ["rotation_z", "Shared rotation Z", "number", { step: "1" }],
-    ["layer_height", "Layer height (mm)", "number", { step: "0.01" }],
-    ["ironing_enabled", "Ironing", "checkbox"],
-    ["ironing_only_highest_layer", "Ironing top layer only", "checkbox"],
-    ...seamSpecs(options),
-    ["infill_pattern", "Infill", "select", { options: options.infill_patterns }],
-    ["infill_sparse_density", "Infill density (%)", "number", { step: "1" }],
-    ["retraction_combing", "Combing", "select", { options: options.combing_modes }],
-    ["adhesion_type", "Bed adhesion", "select", { options: options.adhesion_types }],
-    ["brim_width", "Brim width (mm)", "number", { step: "0.1" }],
-    ["skirt_line_count", "Skirt lines", "number", { step: "1" }],
-    ["raft_margin", "Raft margin (mm)", "number", { step: "0.1" }],
-    ["support_enable", "Supports", "checkbox"],
-    ["support_type", "Support placement", "select", { options: options.support_types }],
-    ["support_structure", "Support structure", "select", { options: options.support_structures }],
-    ["support_angle", "Support angle", "number", { step: "1" }],
-    ["support_infill_rate", "Support density (%)", "number", { step: "1" }],
-  ];
+  const engine = state.settings?.slicer_engine || "cura";
   form.innerHTML = "";
-  for (const [name, label, type, extra] of specs) {
-    form.append(field(name, label, type, extra));
+
+  const general = settingsSection("General", "Shared across printers. Switching engine changes which seam options are shown.");
+  appendFields(general.grid, [
+    ["slicer_engine", "Slicing engine", "select", { options: options.slicer_engines, labels: { cura: "Cura", orca: "Orca" }, tip: "CuraEngine or OrcaSlicer for every slice." }],
+    ["output_folder_name", "Output folder name", "text", { tip: "Subfolder created under each printer in the output directory." }],
+    ["rotation_x", "Shared rotation X", "number", { step: "1", tip: "Degrees applied to every part unless a part has its own rotation." }],
+    ["rotation_y", "Shared rotation Y", "number", { step: "1", tip: "Degrees applied to every part unless a part has its own rotation." }],
+    ["rotation_z", "Shared rotation Z", "number", { step: "1", tip: "Degrees applied to every part unless a part has its own rotation." }],
+    ["layer_height", "Layer height (mm)", "number", { step: "0.01", tip: "Vertical resolution of the print." }],
+  ]);
+  form.append(general.section);
+
+  const ironing = settingsSection("Ironing", "Smooths the top surface with a second pass.");
+  const ironingEnable = field("ironing_enabled", "Ironing", "checkbox", { tip: "Enable the ironing pass on top surfaces." });
+  const ironingOnly = field("ironing_only_highest_layer", "Ironing top layer only", "checkbox", { tip: "Limit ironing to the uppermost top surface." });
+  ironingOnly.dataset.cluster = "ironing-options";
+  ironingOnly.classList.add("cluster");
+  ironing.grid.append(ironingEnable, ironingOnly);
+  form.append(ironing.section);
+
+  const seam = settingsSection("Seam", engine === "orca" ? "Orca seam placement and scarf joint options." : "Cura Z-seam type and corner position.");
+  if (engine === "orca") {
+    const seamField = field("orca_seam", "Seam", "select", {
+      options: options.orca_seam_positions,
+      labels: { nearest: "Nearest", aligned: "Aligned", aligned_back: "Aligned back", back: "Back", random: "Random" },
+      tip: "Where Orca prefers to place the outer wall seam.",
+    });
+    seamField.dataset.cluster = "orca-seam";
+    const scarf = field("orca_scarf_joint", "Scarf joint seam", "select", {
+      options: options.orca_scarf_joints,
+      labels: { none: "None", external: "Contour", all: "Contour and hole" },
+      tip: "Use a scarf joint to hide the seam on outer contours, or on contours and holes.",
+    });
+    scarf.dataset.cluster = "orca-scarf";
+    const conditional = field("orca_scarf_conditional", "Conditional scarf joint", "checkbox", {
+      tip: "Apply scarf joints only on smooth perimeters where a normal seam would still show.",
+    });
+    conditional.dataset.cluster = "orca-scarf-conditional";
+    conditional.classList.add("cluster");
+    seam.grid.append(seamField, scarf, conditional);
+  } else {
+    const type = field("z_seam_type", "Seam", "select", { options: options.seam_types, tip: "How Cura chooses the Z seam." });
+    type.dataset.cluster = "cura-seam";
+    const position = field("z_seam_position", "Seam position", "select", { options: options.seam_positions, tip: "Corner used when seam is user specified." });
+    position.dataset.cluster = "cura-seam-position";
+    position.classList.add("cluster");
+    seam.grid.append(type, position);
   }
+  form.append(seam.section);
+
+  const infill = settingsSection("Infill", "Interior fill pattern and density.");
+  appendFields(infill.grid, [
+    ["infill_pattern", "Infill", "select", { options: options.infill_patterns, tip: "Pattern used inside the model." }],
+    ["infill_sparse_density", "Infill density (%)", "number", { step: "1", tip: "How solid the interior is." }],
+    ["retraction_combing", "Combing", "select", { options: options.combing_modes, tip: "Keep travel moves inside the print to reduce stringing." }],
+  ]);
+  form.append(infill.section);
+
+  const adhesion = settingsSection("Bed adhesion", "Extra material on the bed to help the print stick.");
+  const adhesionType = field("adhesion_type", "Bed adhesion", "select", { options: options.adhesion_types, tip: "None, skirt, brim, or raft." });
+  const brim = field("brim_width", "Brim width (mm)", "number", { step: "0.1", tip: "Width of the brim around the part." });
+  brim.dataset.cluster = "brim";
+  brim.classList.add("cluster");
+  const skirt = field("skirt_line_count", "Skirt lines", "number", { step: "1", tip: "Number of skirt loops around the part." });
+  skirt.dataset.cluster = "skirt";
+  skirt.classList.add("cluster");
+  const raft = field("raft_margin", "Raft margin (mm)", "number", { step: "0.1", tip: "How far the raft extends past the part." });
+  raft.dataset.cluster = "raft";
+  raft.classList.add("cluster");
+  adhesion.grid.append(adhesionType, brim, skirt, raft);
+  form.append(adhesion.section);
+
+  const supports = settingsSection("Supports", "Scaffolding under overhangs.");
+  const supportEnable = field("support_enable", "Supports", "checkbox", { tip: "Generate support structures." });
+  const supportFields = document.createElement("div");
+  supportFields.className = "grid cluster";
+  supportFields.dataset.cluster = "supports";
+  appendFields(supportFields, [
+    ["support_type", "Support placement", "select", { options: options.support_types, tip: "Build plate only, or everywhere an overhang needs help." }],
+    ["support_structure", "Support structure", "select", { options: options.support_structures, tip: "Normal grid supports or tree supports." }],
+    ["support_angle", "Support angle", "number", { step: "1", tip: "Overhangs steeper than this angle get support." }],
+    ["support_infill_rate", "Support density (%)", "number", { step: "1", tip: "Density of the support structure." }],
+  ]);
+  supports.grid.append(supportEnable);
+  supports.section.append(supportFields);
+  form.append(supports.section);
+
+  const arrange = settingsSection(
+    "Group arrangement",
+    "Orca auto-arrange for groups. Parts stay separate objects; the arranged plate is saved as a .3mf beside the source files.",
+  );
+  arrange.section.dataset.cluster = "orca-arrange";
+  arrange.section.classList.add("cluster");
+  appendFields(arrange.grid, [
+    ["orca_arrange_spacing", "Spacing (0 = Auto)", "number", { step: "0.1", tip: "Minimum gap between parts. 0 uses Orca Auto spacing (brim-aware)." }],
+    ["orca_arrange_rotate", "Auto rotate for arrangement", "checkbox", { tip: "Let Orca rotate parts on the bed while packing." }],
+    ["orca_arrange_multicolor", "Allow multiple materials on same plate", "checkbox", { tip: "Keep differently coloured parts on one plate when arranging." }],
+    ["orca_arrange_align_y", "Align to Y axis", "checkbox", { tip: "Prefer aligning parts along Y to reduce bed motion on i3-style printers." }],
+  ]);
+  form.append(arrange.section);
+
   for (const input of form.querySelectorAll("input, select")) {
     const value = state.settings[input.name];
     if (input.type === "checkbox") input.checked = Boolean(value);
     else input.value = value ?? "";
-    input.addEventListener("change", saveSettings);
+    input.addEventListener("change", async () => {
+      syncSettingsVisibility();
+      await saveSettings();
+    });
   }
+  syncSettingsVisibility();
 }
 
 async function saveSettings() {
@@ -659,107 +789,340 @@ async function commitPath(field, value) {
   }
 }
 
+async function saveIncluded(paths) {
+  state.locations = await api("/api/locations", {
+    method: "PUT",
+    body: JSON.stringify({ included: paths }),
+  });
+  state.models = await api("/api/models");
+  renderModels();
+}
+
+async function saveGroups(groups) {
+  state.groups = (await api("/api/groups", { method: "PUT", body: JSON.stringify({ groups }) })).groups;
+  renderModels();
+  if ($("models").classList.contains("active")) await showLayout();
+}
+
+async function deleteGroup(groupId) {
+  const group = state.groups.find((item) => item.id === groupId);
+  if (!group) return;
+  const label = group.name || "this group";
+  if (!window.confirm(`Delete group “${label}”? Arranged .3mf files on disk are kept.`)) return;
+  const next = state.groups.filter((item) => item.id !== groupId);
+  await saveGroups(next);
+}
+
+function renderGroupChips(host) {
+  if (!state.groups.length) return;
+  const chips = document.createElement("div");
+  chips.className = "group-chip-list";
+  for (const group of state.groups) {
+    const chip = document.createElement("span");
+    chip.className = "group-chip";
+    const name = document.createElement("span");
+    name.textContent = `${group.name} (${group.files.length})`;
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "×";
+    remove.title = `Delete group ${group.name}`;
+    remove.addEventListener("click", () => deleteGroup(group.id));
+    chip.append(name, remove);
+    chips.append(chip);
+  }
+  host.append(chips);
+}
+
 function renderModels() {
   const list = $("model-list");
   list.innerHTML = "";
-  if (!state.models.length) {
-    const empty = document.createElement("p");
-    empty.className = "muted";
-    empty.textContent = "No STL or 3MF files in this folder. Browse to a folder that contains models, or paste its path above.";
-    list.append(empty);
-  }
-  for (const model of state.models) {
-    const row = document.createElement("div");
-    row.className = "model-row";
-    const box = document.createElement("input");
-    box.type = "checkbox";
-    box.checked = model.included !== false;
-    box.title = "Include this file when slicing";
-    box.addEventListener("change", async () => {
-      const included = state.models
-        .filter((item) => (item.path === model.path ? box.checked : item.included !== false))
-        .map((item) => item.path);
-      state.locations = await api("/api/locations", {
-        method: "PUT",
-        body: JSON.stringify({ included }),
-      });
-      state.models = await api("/api/models");
-      renderModels();
-    });
-    const button = document.createElement("button");
-    button.type = "button";
-    button.textContent = model.path;
-    if (model.path === state.selectedModel) button.classList.add("primary");
-    button.addEventListener("click", async () => {
-      state.selectedModel = model.path;
-      $("preview-kind").value = "model";
-      renderModels();
-      await showLayout();
-    });
-    row.append(box, button);
-    list.append(row);
-  }
   const groupSelect = $("preview-group");
+  const previousGroup = groupSelect.value;
   groupSelect.innerHTML = "";
-  const host = $("group-list");
-  host.innerHTML = "";
   for (const group of state.groups) {
     const option = document.createElement("option");
     option.value = group.id;
     option.textContent = group.name;
     groupSelect.append(option);
-    const block = document.createElement("div");
-    block.className = "group-block";
-    const title = document.createElement("strong");
+  }
+  if ([...groupSelect.options].some((option) => option.value === previousGroup)) {
+    groupSelect.value = previousGroup;
+  }
+
+  if (!state.models.length) {
+    const empty = document.createElement("p");
+    empty.className = "muted";
+    empty.textContent = "No STL or 3MF files in this folder. Browse to a folder that contains models, or paste its path above.";
+    list.append(empty);
+    renderGroupChips(list);
+    return;
+  }
+
+  if (!state.selectedModel || !state.models.some((model) => model.path === state.selectedModel)) {
+    state.selectedModel = state.models[0].path;
+  }
+
+  const table = document.createElement("table");
+  table.className = "model-matrix";
+  const thead = document.createElement("thead");
+  const headRow = document.createElement("tr");
+
+  const selectAllTh = document.createElement("th");
+  selectAllTh.className = "col-include";
+  const selectAllLabel = document.createElement("label");
+  selectAllLabel.className = "inline select-all";
+  selectAllLabel.title = "Include all files for individual slicing";
+  const selectAll = document.createElement("input");
+  selectAll.type = "checkbox";
+  const includedCount = state.models.filter((model) => model.included).length;
+  selectAll.checked = includedCount > 0 && includedCount === state.models.length;
+  selectAll.indeterminate = includedCount > 0 && includedCount < state.models.length;
+  selectAll.addEventListener("change", async () => {
+    const paths = selectAll.checked ? state.models.map((model) => model.path) : [];
+    await saveIncluded(paths);
+  });
+  selectAllLabel.append(selectAll, document.createTextNode(" All"));
+  selectAllTh.append(selectAllLabel);
+  headRow.append(selectAllTh);
+
+  const fileTh = document.createElement("th");
+  fileTh.className = "col-file";
+  fileTh.textContent = "File";
+  headRow.append(fileTh);
+
+  for (const group of state.groups) {
+    const th = document.createElement("th");
+    th.className = "col-group";
+    th.title = group.name;
+    const wrap = document.createElement("div");
+    wrap.className = "group-head";
+    const title = document.createElement("span");
+    title.className = "group-head-title";
     title.textContent = group.name;
-    block.append(title);
-    for (const model of state.models) {
-      const label = document.createElement("label");
-      label.className = "inline";
+    title.title = group.name;
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "group-remove";
+    remove.textContent = "×";
+    remove.title = `Delete group ${group.name}`;
+    remove.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      await deleteGroup(group.id);
+    });
+    wrap.append(title, remove);
+    th.append(wrap);
+    headRow.append(th);
+  }
+  thead.append(headRow);
+  table.append(thead);
+
+  const tbody = document.createElement("tbody");
+  for (const model of state.models) {
+    const row = document.createElement("tr");
+    if (model.path === state.selectedModel) row.classList.add("selected");
+
+    const includeTd = document.createElement("td");
+    includeTd.className = "col-include";
+    const include = document.createElement("input");
+    include.type = "checkbox";
+    include.checked = Boolean(model.included);
+    include.title = "Include for individual slicing";
+    include.addEventListener("click", (event) => event.stopPropagation());
+    include.addEventListener("change", async () => {
+      const paths = state.models
+        .filter((item) => (item.path === model.path ? include.checked : item.included))
+        .map((item) => item.path);
+      await saveIncluded(paths);
+    });
+    includeTd.append(include);
+    row.append(includeTd);
+
+    const fileTd = document.createElement("td");
+    fileTd.className = "col-file";
+    const fileButton = document.createElement("button");
+    fileButton.type = "button";
+    fileButton.className = "file-pick";
+    fileButton.textContent = model.path;
+    fileButton.title = model.path;
+    fileButton.addEventListener("click", async () => {
+      state.selectedModel = model.path;
+      $("preview-kind").value = "model";
+      renderModels();
+      await showLayout();
+    });
+    fileTd.append(fileButton);
+    row.append(fileTd);
+
+    for (const group of state.groups) {
+      const cell = document.createElement("td");
+      cell.className = "col-group";
       const box = document.createElement("input");
       box.type = "checkbox";
       box.checked = group.files.includes(model.path);
+      box.title = `Include in ${group.name}`;
+      box.addEventListener("click", (event) => event.stopPropagation());
       box.addEventListener("change", async () => {
-        group.files = box.checked
-          ? [...group.files, model.path]
-          : group.files.filter((file) => file !== model.path);
-        state.groups = (await api("/api/groups", { method: "PUT", body: JSON.stringify({ groups: state.groups }) })).groups;
-        await showLayout();
+        const next = state.groups.map((item) => {
+          if (item.id !== group.id) return item;
+          const files = box.checked
+            ? [...new Set([...item.files, model.path])]
+            : item.files.filter((file) => file !== model.path);
+          return { ...item, files, manual_layout: null, arranged_3mf: null };
+        });
+        await saveGroups(next);
       });
-      label.append(box, document.createTextNode(model.path));
-      block.append(label);
+      cell.append(box);
+      row.append(cell);
     }
-    host.append(block);
+
+    row.addEventListener("click", async (event) => {
+      if (event.target.closest("input, button")) return;
+      state.selectedModel = model.path;
+      $("preview-kind").value = "model";
+      renderModels();
+      await showLayout();
+    });
+    tbody.append(row);
   }
-  if (!state.selectedModel && state.models.length) state.selectedModel = state.models[0].path;
+  table.append(tbody);
+  list.append(table);
+  renderGroupChips(list);
+}
+
+function jobItemLabel(item) {
+  return `${item.printer_name} · ${item.item_name}`;
+}
+
+function bedSizeForPrinter(printerId) {
+  if (!printerId) return null;
+  const owned = (state.owned?.printers || []).find(
+    (item) => item.orca_id === printerId || item.cura_id === printerId || item.id === printerId,
+  );
+  const settings = owned && machineSettingsForOwned(owned);
+  if (settings?.bed_width && settings?.bed_depth) {
+    return { width: Number(settings.bed_width), depth: Number(settings.bed_depth) };
+  }
+  const printer = (state.printers || []).find((item) => item.id === printerId);
+  if (printer?.machine_width && printer?.machine_depth) {
+    return { width: Number(printer.machine_width), depth: Number(printer.machine_depth) };
+  }
+  return null;
+}
+
+function machineSettingsForOwned(owned) {
+  const engine = state.settings?.slicer_engine === "orca" ? "orca" : "cura";
+  const custom = engine === "orca" ? owned.orca_settings : owned.cura_settings;
+  return custom || owned.settings || null;
+}
+
+function setGcodeBed(width, depth) {
+  if (!width || !depth || width <= 0 || depth <= 0) {
+    state.gcodeBed = null;
+    gcodeBed.visible = false;
+    gcodeBed.geometry.dispose();
+    gcodeBed.geometry = new BufferGeometry();
+    return;
+  }
+  state.gcodeBed = { width, depth };
+  gcodeBed.visible = true;
+  const points = [
+    new Vector3(0, 0, 0),
+    new Vector3(width, 0, 0),
+    new Vector3(width, depth, 0),
+    new Vector3(0, depth, 0),
+  ];
+  gcodeBed.geometry.dispose();
+  gcodeBed.geometry = new BufferGeometry().setFromPoints(points);
+}
+
+function updateGcodeSelectionLabel() {
+  const label = $("gcode-selection");
+  if (!label) return;
+  if (!state.gcodeLabel) {
+    label.textContent = "Select a finished job row to preview its gcode.";
+    return;
+  }
+  const bed = state.gcodeBed;
+  const bedText = bed ? ` · bed ${formatMm(bed.width)}×${formatMm(bed.depth)} mm` : "";
+  label.textContent = `Showing ${state.gcodeLabel}${bedText}`;
+}
+
+function formatMm(value) {
+  return Number.isInteger(value) ? String(value) : String(Math.round(value * 10) / 10);
+}
+
+function selectJobRow(body, row) {
+  for (const other of body.querySelectorAll("tr")) other.classList.remove("selected");
+  row.classList.add("selected");
 }
 
 function renderJob(job) {
   $("job-status").textContent = job && job.status ? `${job.kind} ${job.status}` : "No job yet";
   const body = $("job-rows");
   body.innerHTML = "";
+  const errorBox = $("job-error");
+  const failed = (job?.items || []).filter((item) => item.error);
+  if (failed.length) {
+    errorBox.hidden = false;
+    errorBox.textContent = failed.map((item) => `${item.printer_name} · ${item.item_name}\n${item.error}`).join("\n\n");
+  } else {
+    errorBox.hidden = true;
+    errorBox.textContent = "";
+  }
   for (const item of job?.items || []) {
     const row = document.createElement("tr");
+    if (item.error || item.status === "failed") row.classList.add("job-failed");
+    const viewable = item.status === "done" && item.output_path;
+    if (viewable || item.error) row.classList.add("job-selectable");
+    if (viewable && state.gcodePath === item.output_path) row.classList.add("selected");
     const time = item.time_seconds == null ? "" : formatDuration(item.time_seconds);
     const filament = item.filament_meters == null ? "" : `${item.filament_meters.toFixed(2)} m`;
-    row.innerHTML = `<td>${item.printer_name}</td><td>${item.item_type}: ${item.item_name}</td><td>${item.status}${item.progress ? ` — ${item.progress}` : ""}${item.error ? ` — ${item.error}` : ""}</td><td>${time}</td><td>${filament}</td><td></td>`;
-    if (item.status === "done" && item.output_path) {
+    const status = item.progress && item.progress !== item.status
+      ? `${item.status} — ${item.progress}`
+      : item.status;
+    row.innerHTML = `<td>${item.printer_name}</td><td>${item.item_type}: ${item.item_name}</td><td class="job-status">${status}</td><td>${time}</td><td>${filament}</td><td></td>`;
+    if (item.error) {
+      row.title = "Click to show the full error below the table";
+      row.addEventListener("click", (event) => {
+        if (event.target.closest("a, button")) return;
+        selectJobRow(body, row);
+        errorBox.hidden = false;
+        errorBox.textContent = `${item.printer_name} · ${item.item_name}\n${item.error}`;
+        errorBox.scrollIntoView({ block: "nearest" });
+      });
+    }
+    if (viewable) {
+      row.title = "Click to preview gcode";
       const link = document.createElement("a");
       link.href = `/api/output?path=${encodeURIComponent(item.output_path)}`;
       link.textContent = "Download";
       row.lastElementChild.append(link);
-      if (job.kind === "test") {
-        const view = document.createElement("button");
-        view.type = "button";
-        view.textContent = "View";
-        view.addEventListener("click", () => loadGcode(item.output_path));
-        row.lastElementChild.append(view);
-      }
+      const view = document.createElement("button");
+      view.type = "button";
+      view.textContent = "View";
+      const openPreview = () => {
+        selectJobRow(body, row);
+        loadGcode(item.output_path, jobItemLabel(item), bedSizeForPrinter(item.printer_id));
+      };
+      view.addEventListener("click", (event) => {
+        event.stopPropagation();
+        openPreview();
+      });
+      row.lastElementChild.append(view);
+      row.addEventListener("click", (event) => {
+        if (event.target.closest("a, button")) return;
+        openPreview();
+      });
     }
     body.append(row);
   }
-  const testItem = (job?.items || []).find((item) => job.kind === "test" && item.status === "done");
-  if (testItem && state.gcodePath !== testItem.output_path) loadGcode(testItem.output_path);
+  updateGcodeSelectionLabel();
+  const testItem = (job?.items || []).find(
+    (item) => job.kind === "test" && item.status === "done" && item.output_path,
+  );
+  if (testItem && state.gcodePath !== testItem.output_path) {
+    loadGcode(testItem.output_path, jobItemLabel(testItem), bedSizeForPrinter(testItem.printer_id));
+  }
 }
 
 function formatDuration(seconds) {
@@ -769,21 +1132,56 @@ function formatDuration(seconds) {
   return `${minutes}m`;
 }
 
-async function loadGcode(path) {
+function frameGcodeCamera(min, max) {
+  const sizeX = Math.max(1, max.x - min.x);
+  const sizeY = Math.max(1, max.y - min.y);
+  const sizeZ = Math.max(1, max.z - min.z);
+  gcodeView.orbit.target.set((min.x + max.x) / 2, (min.y + max.y) / 2, (min.z + max.z) / 2);
+  gcodeView.orbit.radius = Math.max(sizeX, sizeY, sizeZ) * 1.8;
+  gcodeView.orbit.theta = 0.7;
+  gcodeView.orbit.phi = 1.05;
+  state.gcodeFramed = true;
+}
+
+function gcodeFrameBounds(toolMin, toolMax) {
+  const min = { ...toolMin };
+  const max = { ...toolMax };
+  const bed = state.gcodeBed;
+  if (bed) {
+    min.x = Math.min(min.x, 0);
+    min.y = Math.min(min.y, 0);
+    min.z = Math.min(min.z, 0);
+    max.x = Math.max(max.x, bed.width);
+    max.y = Math.max(max.y, bed.depth);
+    max.z = Math.max(max.z, 0);
+  }
+  return { min, max };
+}
+
+async function loadGcode(path, label = null, bed = null) {
   state.gcodePath = path;
+  state.gcodeLabel = label || path;
+  state.gcodeFramed = false;
+  state.gcodeDrag = null;
+  if (bed) setGcodeBed(bed.width, bed.depth);
+  else setGcodeBed(0, 0);
+  updateGcodeSelectionLabel();
   const info = await api(`/api/gcode/info?path=${encodeURIComponent(path)}`);
   state.gcodeLayers = info.layer_count;
   const slider = $("layer-slider");
   slider.max = String(Math.max(0, info.layer_count - 1));
   slider.value = "0";
-  await drawLayer(0);
+  await drawLayer(0, true);
 }
 
-async function drawLayer(index) {
+async function drawLayer(index, frame = false) {
   if (!state.gcodePath) return;
+  const request = ++state.gcodeLayerRequest;
   $("layer-label").textContent = `${index + 1} / ${state.gcodeLayers}`;
   const include = $("show-travel").checked;
-  const layer = await api(`/api/gcode/layer?path=${encodeURIComponent(state.gcodePath)}&index=${index}&include_travel=${include}`);
+  const path = state.gcodePath;
+  const layer = await api(`/api/gcode/layer?path=${encodeURIComponent(path)}&index=${index}&include_travel=${include}`);
+  if (request !== state.gcodeLayerRequest || state.gcodePath !== path) return;
   for (const child of [...gcodeView.scene.children]) {
     if (child.userData.toolpath) {
       child.geometry.dispose();
@@ -799,10 +1197,18 @@ async function drawLayer(index) {
     "SUPPORT-INTERFACE": 0x43aa8b,
     TRAVEL: 0x666666,
   };
-  let maxSpan = 10;
+  const min = { x: Infinity, y: Infinity, z: Infinity };
+  const max = { x: -Infinity, y: -Infinity, z: -Infinity };
   for (const polyline of layer.polylines) {
     const points = polyline.points.map((point) => new Vector3(point[0], point[1], point[2]));
-    for (const point of points) maxSpan = Math.max(maxSpan, point.x, point.y, point.z);
+    for (const point of points) {
+      min.x = Math.min(min.x, point.x);
+      min.y = Math.min(min.y, point.y);
+      min.z = Math.min(min.z, point.z);
+      max.x = Math.max(max.x, point.x);
+      max.y = Math.max(max.y, point.y);
+      max.z = Math.max(max.z, point.z);
+    }
     const line = new Line(
       new BufferGeometry().setFromPoints(points),
       new LineBasicMaterial({ color: new Color(colors[polyline.type] || 0xffffff) }),
@@ -810,8 +1216,47 @@ async function drawLayer(index) {
     line.userData.toolpath = true;
     gcodeView.scene.add(line);
   }
-  gcodeView.orbit.target.set(maxSpan / 4, maxSpan / 4, 0);
-  gcodeView.orbit.radius = maxSpan * 1.4;
+  if ((frame || !state.gcodeFramed) && (Number.isFinite(min.x) || state.gcodeBed)) {
+    const bounds = Number.isFinite(min.x)
+      ? gcodeFrameBounds(min, max)
+      : gcodeFrameBounds(
+          { x: 0, y: 0, z: 0 },
+          { x: state.gcodeBed.width, y: state.gcodeBed.depth, z: 0 },
+        );
+    frameGcodeCamera(bounds.min, bounds.max);
+  }
+}
+
+function bindGcodePointer() {
+  const canvas = gcodeView.canvas;
+  canvas.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    state.gcodeDrag = {
+      x: event.clientX,
+      y: event.clientY,
+      theta: gcodeView.orbit.theta,
+      phi: gcodeView.orbit.phi,
+    };
+    canvas.setPointerCapture(event.pointerId);
+  });
+  canvas.addEventListener("pointermove", (event) => {
+    if (!state.gcodeDrag) return;
+    gcodeView.orbit.theta = state.gcodeDrag.theta - (event.clientX - state.gcodeDrag.x) * 0.01;
+    gcodeView.orbit.phi = Math.min(
+      1.45,
+      Math.max(0.15, state.gcodeDrag.phi + (event.clientY - state.gcodeDrag.y) * 0.01),
+    );
+  });
+  const endDrag = () => {
+    state.gcodeDrag = null;
+  };
+  canvas.addEventListener("pointerup", endDrag);
+  canvas.addEventListener("pointercancel", endDrag);
+  canvas.addEventListener("lostpointercapture", endDrag);
+  canvas.addEventListener("wheel", (event) => {
+    event.preventDefault();
+    gcodeView.orbit.radius = Math.max(20, Math.min(5000, gcodeView.orbit.radius * (event.deltaY > 0 ? 1.08 : 0.92)));
+  }, { passive: false });
 }
 
 function setMode(mode) {
@@ -858,8 +1303,11 @@ const OWNED_SECTIONS = [
   ["Speeds", [
     ["retraction_length", "Retraction length (mm)", "number", "0.1"],
     ["retraction_speed", "Retraction speed (mm/s)", "number", "1"],
-    ["z_hop", "Z hop (mm)", "number", "0.1"],
     ["travel_speed", "Travel speed (mm/s)", "number", "1"],
+  ]],
+  ["Z hop", [
+    ["z_hop", "Z hop height (mm)", "number", "0.1"],
+    ["z_hop_type", "Z hop type", "select"],
   ]],
 ];
 
@@ -988,13 +1436,14 @@ function ownedField([name, label, type, step], settings) {
     input.checked = Boolean(settings[name]);
     wrap.classList.add("inline");
   } else if (type === "select") {
-    for (const flavor of state.options.gcode_flavors || []) {
+    const options = selectOptionsForField(name);
+    for (const value of options) {
       const option = document.createElement("option");
-      option.value = flavor;
-      option.textContent = flavor;
+      option.value = value;
+      option.textContent = value;
       input.append(option);
     }
-    input.value = settings[name] || "Marlin";
+    input.value = settings[name] || options[0] || "";
   } else {
     input.type = "number";
     input.step = step;
@@ -1007,6 +1456,18 @@ function ownedField([name, label, type, step], settings) {
     hint.textContent = "Orca writes Klipper. Cura has no Klipper flavor, so a Cura slice uses Marlin gcode, which Klipper runs.";
     wrap.append(hint);
   }
+  if (name === "z_hop") {
+    const hint = document.createElement("span");
+    hint.className = "muted";
+    hint.textContent = "0 disables Z hop. Orca also gets the hop type below; Cura enables retraction hop when height is above 0.";
+    wrap.append(hint);
+  }
+  if (name === "z_hop_type") {
+    const hint = document.createElement("span");
+    hint.className = "muted";
+    hint.textContent = "Used by Orca (Normal / Slope / Spiral / Auto Lift).";
+    wrap.append(hint);
+  }
   if (name === "temperature_override") {
     const hint = document.createElement("span");
     hint.className = "muted";
@@ -1016,6 +1477,12 @@ function ownedField([name, label, type, step], settings) {
     wrap.append(hint);
   }
   return wrap;
+}
+
+function selectOptionsForField(name) {
+  if (name === "z_hop_type") return state.options.z_hop_types || ["Normal Lift"];
+  if (name === "gcode_flavor") return state.options.gcode_flavors || ["Marlin"];
+  return [];
 }
 
 function syncTemperatureFields(fromToggle) {
@@ -1408,7 +1875,7 @@ async function applyBrowser(filesOnly) {
   if (field === "input_dir") {
     body.included = filesOnly
       ? [...$("browser-list").querySelectorAll("input:checked")].map((box) => box.dataset.file)
-      : null;
+      : [];
     if (filesOnly && !body.included.length) {
       $("browser-error").textContent = "Select one or more STL or 3MF files.";
       return;
@@ -1431,10 +1898,8 @@ async function applyBrowser(filesOnly) {
 }
 $("add-group").addEventListener("click", async () => {
   const name = $("group-name").value.trim() || `group ${state.groups.length + 1}`;
-  state.groups.push({ name, files: state.selectedModel ? [state.selectedModel] : [] });
-  state.groups = (await api("/api/groups", { method: "PUT", body: JSON.stringify({ groups: state.groups }) })).groups;
+  await saveGroups([...state.groups, { name, files: [], manual_layout: null, arranged_3mf: null }]);
   $("group-name").value = "";
-  renderModels();
 });
 $("preview-printer").addEventListener("change", showLayout);
 $("preview-kind").addEventListener("change", showLayout);
@@ -1499,6 +1964,11 @@ function pollJob() {
 }
 
 bindPreviewPointer();
+bindGcodePointer();
+$("reset-gcode-view").addEventListener("click", () => {
+  state.gcodeFramed = false;
+  drawLayer(Number($("layer-slider").value), true);
+});
 
 const boot = await Promise.all([
   api("/api/health"),

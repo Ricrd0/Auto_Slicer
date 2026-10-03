@@ -5,11 +5,15 @@ from pathlib import Path
 from auto_slicer.cura_config import PrinterProfile
 from auto_slicer.meshio import transform_mesh
 from auto_slicer.orca_config import (
+    build_orca_arrange_command,
     build_orca_command,
     discover_filaments,
     discover_orca_printers,
     extract_plate_gcode,
+    process_inherits_for_machine,
     search_filaments,
+    write_assemble_list,
+    write_process_profile,
 )
 from auto_slicer.settings_schema import SliceSettings, orca_setting_overrides
 
@@ -179,8 +183,84 @@ def test_orca_command_slices_without_arranging(tmp_path: Path) -> None:
     assert "--export-3mf" in command
     assert "--load-settings" in command
     assert "--load-assemble-list" in command
+    assert "--min-save" in command
+    assert command[-1] == "--min-save"
     assert "--arrange" not in text
+    assert "--assemble" not in text
     assert str(mesh) not in command
+
+
+def test_assemble_list_keeps_parts_as_separate_objects(tmp_path: Path) -> None:
+    meshes = [tmp_path / "a.stl", tmp_path / "b.stl"]
+    path = tmp_path / "assemble.json"
+    write_assemble_list(path, meshes)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    plate = payload["plates"][0]
+    assert plate["need_arrange"] is False
+    assert len(plate["objects"]) == 2
+    for obj in plate["objects"]:
+        assert "assemble_index" not in obj
+
+
+def test_arrange_command_keeps_parts_separate_and_exports_full_3mf(tmp_path: Path) -> None:
+    printer = PrinterProfile(
+        id="orca:Ender",
+        name="Ender",
+        definition_id="Ender",
+        definition_path=str(tmp_path / "machine.json"),
+        extruder_definition_id=None,
+        extruder_definition_path=None,
+        global_settings=[],
+        extruder_settings=[],
+        machine_width=220,
+        machine_depth=220,
+        machine_height=250,
+        machine_center_is_zero=False,
+        extruder_count=1,
+        setting_version=None,
+        resource_setting_version=None,
+        engine="orca",
+    )
+    meshes = [tmp_path / "a.stl", tmp_path / "b.stl"]
+    command = build_orca_arrange_command(
+        Path("orca-slicer"),
+        printer,
+        meshes,
+        tmp_path / "arranged.3mf",
+        tmp_path,
+        tmp_path / "process.json",
+        tmp_path / "filament.json",
+        SliceSettings(
+            orca_arrange_spacing=0,
+            orca_arrange_rotate=False,
+            orca_arrange_multicolor=True,
+            orca_arrange_align_y=True,
+        ),
+    )
+    text = " ".join(command)
+    assert "--arrange=1" in command
+    assert "--allow-rotations=0" in command
+    assert "--allow-multicolor-oneplate=1" in command
+    assert "--assemble" not in text
+    assert "--min-save" not in text
+    assert "--load-assemble-list" not in text
+    assert str(meshes[0]) in command and str(meshes[1]) in command
+
+
+def test_process_profile_uses_the_machine_default_print_profile(tmp_path: Path) -> None:
+    assert process_inherits_for_machine({"default_print_profile": "0.20mm Standard @Artillery X1"}) == (
+        "0.20mm Standard @Artillery X1"
+    )
+    path = tmp_path / "process.json"
+    write_process_profile(
+        path,
+        SliceSettings(),
+        inherits="0.20mm Standard @Artillery X1",
+        compatible_printers=["Artillery Sidewinder X1 0.4 nozzle"],
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["inherits"] == "0.20mm Standard @Artillery X1"
+    assert payload["compatible_printers"] == ["Artillery Sidewinder X1 0.4 nozzle"]
 
 
 def test_orca_seam_is_stored_separately_from_cura() -> None:
@@ -195,6 +275,11 @@ def test_shared_settings_map_onto_orca_keys() -> None:
     assert values["layer_height"] == "0.2"
     assert values["ironing_type"] == "topmost"
     assert values["seam_position"] == "back"
+    assert values["seam_slope_type"] == "external"
+    assert values["seam_slope_conditional"] == "1"
+    off = orca_setting_overrides(SliceSettings(orca_scarf_joint="none", orca_scarf_conditional=False))
+    assert off["seam_slope_type"] == "none"
+    assert off["seam_slope_conditional"] == "0"
     assert values["sparse_infill_pattern"] == "lightning"
     assert values["sparse_infill_density"] == "5%"
     assert values["brim_type"] == "outer_only"

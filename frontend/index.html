@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Auto Slicer</title>
-  <link rel="stylesheet" href="/style.css?v=8">
+  <link rel="stylesheet" href="/style.css?v=13">
   <script type="importmap">
     { "imports": { "three": "/vendor/three.module.js" } }
   </script>
@@ -96,17 +96,14 @@
         </label>
       </div>
       <p id="path-error" class="notice"></p>
-      <div class="split">
-        <div>
+      <div class="split models-split">
+        <div class="models-side">
           <div class="toolbar">
             <button type="button" id="refresh-models">Refresh files</button>
-          </div>
-          <div id="model-list" class="list"></div>
-          <div class="toolbar">
             <input id="group-name" placeholder="Group name">
             <button type="button" id="add-group">Add group</button>
           </div>
-          <div id="group-list"></div>
+          <div id="model-list" class="list model-matrix-wrap"></div>
         </div>
         <div>
           <div class="toolbar">
@@ -135,17 +132,22 @@
         <button type="button" id="start-batch" class="primary">Slice all printers</button>
         <span id="job-status" class="muted"></span>
       </div>
-      <table>
-        <thead>
-          <tr><th>Printer</th><th>Item</th><th>Status</th><th>Time</th><th>Filament</th><th></th></tr>
-        </thead>
-        <tbody id="job-rows"></tbody>
-      </table>
-      <h2>Test gcode</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Printer</th><th>Item</th><th>Status</th><th>Time</th><th>Filament</th><th></th></tr>
+          </thead>
+          <tbody id="job-rows"></tbody>
+        </table>
+      </div>
+      <pre id="job-error" class="job-error" hidden></pre>
+      <h2>G-code preview</h2>
+      <p id="gcode-selection" class="muted">Select a finished job row to preview its gcode.</p>
       <div class="toolbar">
         <label>Layer <input id="layer-slider" type="range" min="0" max="0" value="0"></label>
         <span id="layer-label">0</span>
         <label class="inline"><input id="show-travel" type="checkbox"> Show travel</label>
+        <button type="button" id="reset-gcode-view">Reset view</button>
       </div>
       <canvas id="gcode-view"></canvas>
     </section>
@@ -167,6 +169,6 @@
       <button type="button" id="browser-files">Slice selected files</button>
     </div>
   </dialog>
-  <script type="module" src="/app.js?v=11"></script>
+  <script type="module" src="/app.js?v=21"></script>
 </body>
 </html>

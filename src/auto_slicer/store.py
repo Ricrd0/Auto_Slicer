@@ -263,12 +263,17 @@ def _normalize_group(group: dict[str, Any]) -> dict[str, Any]:
         normalized_manual = {}
         for name, position in manual.items():
             if isinstance(position, dict) and "x" in position and "y" in position:
-                normalized_manual[str(name)] = {"x": float(position["x"]), "y": float(position["y"])}
+                entry: dict[str, float] = {"x": float(position["x"]), "y": float(position["y"])}
+                if position.get("rotation_z") is not None:
+                    entry["rotation_z"] = float(position["rotation_z"])
+                normalized_manual[str(name)] = entry
+    arranged = group.get("arranged_3mf")
     return {
         "id": str(group.get("id") or uuid.uuid4().hex),
         "name": str(group.get("name") or "group"),
         "files": [str(item) for item in files],
         "manual_layout": normalized_manual,
+        "arranged_3mf": str(arranged) if arranged else None,
     }
 
 

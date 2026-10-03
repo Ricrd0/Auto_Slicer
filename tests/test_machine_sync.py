@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 from auto_slicer.cura_config import PrinterProfile
 from auto_slicer.machine_sync import (
     apply_filament,
@@ -11,7 +14,24 @@ from auto_slicer.machine_sync import (
     normalize_owned,
     orca_filament_overrides,
     patch_orca_machine,
+    sync_owned_with_orca_user_profiles,
 )
+from auto_slicer.orca_config import apply_user_orca_machine_override, user_orca_machine_override
+
+
+def test_z_hop_options_are_written_for_both_engines() -> None:
+    machine = normalize_machine({"z_hop": 0.4, "z_hop_type": "Spiral Lift"})
+    cura = dict(cura_machine_overrides(machine))
+    assert cura["retraction_hop"] == "0.4"
+    assert cura["retraction_hop_enabled"] == "true"
+    patched = patch_orca_machine({}, machine)
+    assert patched["z_hop"] == ["0.4"]
+    assert patched["z_hop_types"] == ["Spiral Lift"]
+    filament = orca_filament_overrides(machine)
+    assert filament["filament_z_hop"] == ["0.4"]
+    assert filament["filament_z_hop_types"] == ["Spiral Lift"]
+    disabled = dict(cura_machine_overrides(normalize_machine({"z_hop": 0})))
+    assert disabled["retraction_hop_enabled"] == "false"
 
 
 def _printer(name: str, engine: str = "orca", **extra: object) -> PrinterProfile:
@@ -129,6 +149,61 @@ def test_missing_initial_temperatures_follow_the_print_temperature() -> None:
     assert machine["nozzle_temperature_initial"] == 205
     assert machine["bed_temperature_initial"] == 55
     assert machine["temperature_override"] is False
+
+
+def test_user_klipper_override_is_preferred_for_orca_machine(tmp_path: Path) -> None:
+    system = tmp_path / "system" / "Creality" / "machine"
+    user = tmp_path / "user" / "default" / "machine"
+    system.mkdir(parents=True)
+    user.mkdir(parents=True)
+    (system / "Creality Ender-3 0.4 nozzle.json").write_text(
+        json.dumps(
+            {
+                "type": "machine",
+                "name": "Creality Ender-3 0.4 nozzle",
+                "instantiation": "true",
+                "nozzle_diameter": ["0.4"],
+                "printable_area": ["0x0", "220x0", "220x220", "0x220"],
+                "printable_height": "250",
+                "gcode_flavor": "marlin",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (user / "Creality Ender-3 - Klipper.json").write_text(
+        json.dumps(
+            {
+                "type": "machine",
+                "name": "Creality Ender-3 - Klipper",
+                "inherits": "Creality Ender-3 0.4 nozzle",
+                "instantiation": "true",
+                "gcode_flavor": "klipper",
+                "machine_start_gcode": "G28 ; klipper",
+            }
+        ),
+        encoding="utf-8",
+    )
+    override = user_orca_machine_override(tmp_path, "Creality Ender-3 0.4 nozzle")
+    assert override is not None
+    assert override["gcode_flavor"] == "klipper"
+    merged = apply_user_orca_machine_override(
+        {"name": "Creality Ender-3 0.4 nozzle", "gcode_flavor": "marlin"},
+        tmp_path,
+    )
+    assert merged["gcode_flavor"] == "klipper"
+    assert merged["machine_start_gcode"] == "G28 ; klipper"
+    owned = [
+        normalize_owned(
+            {
+                "name": "Creality Ender-3",
+                "orca_id": "orca:Creality Ender-3 0.4 nozzle",
+                "settings": {"gcode_flavor": "Marlin", "bed_width": 230},
+            }
+        )
+    ]
+    healed = sync_owned_with_orca_user_profiles(owned, tmp_path)
+    assert healed[0]["settings"]["gcode_flavor"] == "Klipper"
+    assert healed[0]["settings"]["orca_start_gcode"] == "G28 ; klipper"
 
 
 def test_shared_filament_temperatures_apply_unless_the_printer_overrides() -> None:

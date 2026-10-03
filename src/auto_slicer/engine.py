@@ -101,17 +101,28 @@ def run_slice(
         encoding="utf-8",
         errors="replace",
     )
-    tail: list[str] = []
+    lines: list[str] = []
     assert process.stdout is not None
     for line in process.stdout:
         stripped = line.rstrip()
         if stripped:
-            tail.append(stripped)
-            tail = tail[-40:]
+            lines.append(stripped)
+            lines = lines[-200:]
             if on_progress is not None and "progress" in stripped.lower():
                 on_progress(stripped)
     code = process.wait()
-    return code, "\n".join(tail)
+    return code, _summarize_engine_output(lines, code)
+
+
+def _summarize_engine_output(lines: list[str], code: int) -> str:
+    markers = ("error", "fail", "invalid", "missing", "can not", "cannot", "unknown", "not found")
+    interesting = [line for line in lines if any(marker in line.lower() for marker in markers)]
+    chosen = interesting[-30:] if interesting else lines[-40:]
+    body = "\n".join(chosen).strip()
+    if code != 0:
+        prefix = f"exit {code}"
+        return f"{prefix}\n{body}" if body else prefix
+    return body
 
 
 def _setting_args(pairs: list[tuple[str, str]]) -> list[str]:

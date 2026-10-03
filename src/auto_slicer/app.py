@@ -9,11 +9,12 @@ from fastapi.staticfiles import StaticFiles
 from auto_slicer.browse import browse, gcode_root, model_root, public_locations, update_locations
 from auto_slicer.bundles import export_all, export_printer, import_bundle
 from auto_slicer.cura_config import active_config_dir
-from auto_slicer.engine import locate_cura
+from auto_slicer.engine import EngineError, locate_cura
 from auto_slicer.orca_config import active_orca_dir, locate_orca, search_filaments
 from auto_slicer.gcode import gcode_info, layer_polylines
 from auto_slicer.machine_sync import (
     GCODE_FLAVORS,
+    Z_HOP_TYPES,
     apply_save_scope,
     machine_from_cura,
     machine_from_orca,
@@ -28,6 +29,7 @@ from auto_slicer.settings_schema import (
     ADHESION_TYPES,
     COMBING_MODES,
     INFILL_PATTERNS,
+    ORCA_SCARF_JOINTS,
     ORCA_SEAM_POSITIONS,
     SEAM_POSITIONS,
     SEAM_TYPES,
@@ -37,6 +39,7 @@ from auto_slicer.settings_schema import (
     SliceSettings,
 )
 from auto_slicer.slicing import (
+    ensure_group_layout,
     freeze_layout,
     layout_for_group,
     layout_for_model,
@@ -88,12 +91,14 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
             "seam_types": SEAM_TYPES,
             "seam_positions": SEAM_POSITIONS,
             "orca_seam_positions": ORCA_SEAM_POSITIONS,
+            "orca_scarf_joints": ORCA_SCARF_JOINTS,
             "combing_modes": COMBING_MODES,
             "support_types": SUPPORT_TYPES,
             "support_structures": SUPPORT_STRUCTURES,
             "infill_patterns": INFILL_PATTERNS,
             "slicer_engines": SLICER_ENGINES,
             "gcode_flavors": GCODE_FLAVORS,
+            "z_hop_types": Z_HOP_TYPES,
         }
 
     @app.get("/api/settings")
@@ -332,10 +337,17 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
     @app.get("/api/models")
     def get_models() -> list[dict[str, object]]:
         models = list_models(model_root(store))
+        arranged = {
+            str(group["arranged_3mf"])
+            for group in store.load_groups()
+            if group.get("arranged_3mf")
+        }
+        if arranged:
+            models = [model for model in models if str(model["path"]) not in arranged]
         included = store.load_locations().get("included")
-        chosen = None if included is None else {str(item) for item in included}
+        chosen = {str(item) for item in included} if isinstance(included, list) else set()
         for model in models:
-            model["included"] = chosen is None or str(model["path"]) in chosen
+            model["included"] = str(model["path"]) in chosen
         return models
 
     @app.get("/api/models/mesh")
@@ -427,7 +439,11 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
         poses = store.load_poses()
         if group.get("manual_layout"):
             positions = dict(group["manual_layout"])
-            positions[file_name] = {"x": float(payload["x"]), "y": float(payload["y"])}
+            moved: dict[str, float] = {"x": float(payload["x"]), "y": float(payload["y"])}
+            prior = positions.get(file_name)
+            if isinstance(prior, dict) and prior.get("rotation_z") is not None:
+                moved["rotation_z"] = float(prior["rotation_z"])
+            positions[file_name] = moved
         else:
             current = layout_for_group(
                 model_root(store),
@@ -439,6 +455,7 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
             )
             positions = freeze_layout(current, file_name, float(payload["x"]), float(payload["y"]))
         group["manual_layout"] = positions
+
         store.save_groups(groups)
         layout = layout_for_group(
             model_root(store),
@@ -457,6 +474,7 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
         if group is None:
             raise HTTPException(status_code=404, detail="group was not found")
         group["manual_layout"] = None
+        group["arranged_3mf"] = None
         store.save_groups(groups)
         return {"groups": groups}
 
@@ -476,25 +494,31 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
                     poses.get(str(payload.get("model", ""))),
                 )
             elif kind == "group":
+                groups = store.load_groups()
                 group = next(
-                    (item for item in store.load_groups() if item["id"] == str(payload.get("group_id", ""))),
+                    (item for item in groups if item["id"] == str(payload.get("group_id", ""))),
                     None,
                 )
                 if group is None:
                     raise HTTPException(status_code=404, detail="group was not found")
-                layout = layout_for_group(
+                layout, dirty = ensure_group_layout(
                     model_root(store),
-                    list(group["files"]),
+                    group,
                     printer,
                     settings,
                     poses,
-                    group.get("manual_layout"),
                 )
+                if dirty:
+                    store.save_groups(groups)
+                result = _layout_dict(layout)
+                result["manual_layout"] = group.get("manual_layout")
+                result["arranged_3mf"] = group.get("arranged_3mf")
+                return result
             else:
                 raise HTTPException(status_code=400, detail="kind must be model or group")
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail="model not found") from exc
-        except ValueError as exc:
+        except (EngineError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return _layout_dict(layout)
 

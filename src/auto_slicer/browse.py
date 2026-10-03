@@ -91,14 +91,15 @@ def update_locations(store: Store, payload: dict[str, object]) -> dict[str, obje
     if "input_dir" in payload:
         assigned = _assign_dir(payload.get("input_dir"), mounts, roots, create=False)
         if assigned != current.get("input_dir"):
-            current["included"] = None
+            # New folders start with nothing selected for individual slicing.
+            current["included"] = []
         current["input_dir"] = assigned
     if "output_dir" in payload:
         current["output_dir"] = _assign_dir(payload.get("output_dir"), mounts, roots, create=True)
     if "included" in payload:
         included = payload.get("included")
         if included is None:
-            current["included"] = None
+            current["included"] = []
         elif isinstance(included, list):
             current["included"] = [str(item) for item in included]
         else:

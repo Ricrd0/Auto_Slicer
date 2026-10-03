@@ -16,13 +16,16 @@ from auto_slicer.machine_sync import (
     patch_orca_machine,
 )
 from auto_slicer.meshio import load_model, transform_mesh, write_stl
+from auto_slicer.orca_arrange import arrange_group, layout_from_arranged_3mf
 from auto_slicer.orca_config import (
     active_orca_dir,
+    apply_user_orca_machine_override,
     build_orca_command,
     extract_plate_gcode,
     generic_pla,
     locate_orca,
     orca_origin,
+    process_inherits_for_machine,
     write_assemble_list,
     write_filament_profile,
     write_process_profile,
@@ -131,35 +134,140 @@ def layout_for_group(
     poses: dict[str, dict[str, Any]],
     manual_layout: dict[str, Any] | None,
 ) -> Layout:
-    parts = [
-        replace(
-            _footprint(
-                input_dir,
-                relative,
-                effective_rotation(settings, poses.get(relative)),
-                pose_scale(poses.get(relative)),
-            ),
-            z=pose_z(poses.get(relative)),
+    parts = []
+    for relative in files:
+        base = effective_rotation(settings, poses.get(relative))
+        arrange_z = _manual_rotation_z(manual_layout, relative)
+        rotation = (base[0], base[1], base[2] + arrange_z)
+        parts.append(
+            replace(
+                _footprint(
+                    input_dir,
+                    relative,
+                    rotation,
+                    pose_scale(poses.get(relative)),
+                ),
+                z=pose_z(poses.get(relative)),
+            )
         )
-        for relative in files
-    ]
     manual = None
     if isinstance(manual_layout, dict):
         manual = {name: (float(pos["x"]), float(pos["y"])) for name, pos in manual_layout.items()}
+    # Frozen / Orca-arranged positions already include spacing; only shelf-pack
+    # needs the adhesion-based gap when inventing a layout.
+    gap = 0.0 if manual is not None else pack_gap(settings)
     return place_group(
         parts,
         float(printer.machine_width or 0),
         float(printer.machine_depth or 0),
         float(printer.machine_height or 0),
-        pack_gap(settings),
+        gap,
         manual,
     )
 
 
-def freeze_layout(layout: Layout, moved_file: str, x: float, y: float) -> dict[str, dict[str, float]]:
-    positions = {item.file: {"x": item.min_x, "y": item.min_y} for item in layout.items}
-    positions[moved_file] = {"x": x, "y": y}
+def freeze_layout(
+    layout: Layout,
+    moved_file: str,
+    x: float,
+    y: float,
+    previous: dict[str, Any] | None = None,
+) -> dict[str, dict[str, float]]:
+    positions: dict[str, dict[str, float]] = {}
+    for item in layout.items:
+        entry: dict[str, float] = {"x": item.min_x, "y": item.min_y}
+        prior = previous.get(item.file) if isinstance(previous, dict) else None
+        if isinstance(prior, dict) and "rotation_z" in prior:
+            entry["rotation_z"] = float(prior["rotation_z"])
+        positions[item.file] = entry
+    moved: dict[str, float] = {"x": x, "y": y}
+    prior_moved = previous.get(moved_file) if isinstance(previous, dict) else None
+    if isinstance(prior_moved, dict) and "rotation_z" in prior_moved:
+        moved["rotation_z"] = float(prior_moved["rotation_z"])
+    elif moved_file in positions and "rotation_z" in positions[moved_file]:
+        moved["rotation_z"] = positions[moved_file]["rotation_z"]
+    positions[moved_file] = moved
     return positions
+
+
+def ensure_group_layout(
+    input_dir: Path,
+    group: dict[str, Any],
+    printer: PrinterProfile,
+    settings: SliceSettings,
+    poses: dict[str, dict[str, Any]],
+    machine: dict[str, object] | None = None,
+) -> tuple[Layout, bool]:
+    """Return a group layout, running Orca auto-arrange when needed.
+
+    When the engine is Orca and the group has no frozen layout, arrange the
+    parts, write a reusable ``.3mf`` beside the source files, and freeze the
+    resulting front-left positions onto the group. Returns ``(layout, dirty)``
+    where ``dirty`` means the caller should persist the group.
+    """
+    files = list(group["files"])
+    manual = group.get("manual_layout")
+    if isinstance(manual, dict) and manual:
+        refreshed = _refresh_layout_from_arranged_3mf(input_dir, group, files)
+        if refreshed is not None:
+            group["manual_layout"] = refreshed
+            return (
+                layout_for_group(input_dir, files, printer, settings, poses, refreshed),
+                True,
+            )
+        return (
+            layout_for_group(input_dir, files, printer, settings, poses, manual),
+            False,
+        )
+    if settings.slicer_engine == "orca":
+        positions, archive = arrange_group(
+            input_dir,
+            files,
+            printer,
+            settings,
+            poses,
+            str(group.get("name") or "group"),
+            machine,
+        )
+        group["manual_layout"] = positions
+        try:
+            group["arranged_3mf"] = archive.relative_to(input_dir).as_posix()
+        except ValueError:
+            group["arranged_3mf"] = archive.name
+        return (
+            layout_for_group(input_dir, files, printer, settings, poses, positions),
+            True,
+        )
+    return layout_for_group(input_dir, files, printer, settings, poses, None), False
+
+
+def _manual_rotation_z(manual_layout: dict[str, Any] | None, relative: str) -> float:
+    if not isinstance(manual_layout, dict):
+        return 0.0
+    position = manual_layout.get(relative)
+    if not isinstance(position, dict) or position.get("rotation_z") is None:
+        return 0.0
+    return float(position["rotation_z"])
+
+
+def _refresh_layout_from_arranged_3mf(
+    input_dir: Path,
+    group: dict[str, Any],
+    files: list[str],
+) -> dict[str, dict[str, float]] | None:
+    """Rebuild frozen layout from the saved project when rotation data is missing."""
+    manual = group.get("manual_layout")
+    if not isinstance(manual, dict) or not manual:
+        return None
+    if all(isinstance(pos, dict) and pos.get("rotation_z") is not None for pos in manual.values()):
+        return None
+    arranged = group.get("arranged_3mf")
+    if not arranged:
+        return None
+    archive = input_dir / safe_relative(str(arranged))
+    if not archive.is_file():
+        return None
+    return layout_from_arranged_3mf(archive.read_bytes(), files)
 
 
 def prepare_slice(
@@ -262,13 +370,28 @@ def _run_orca(
     root = Path(prepared.temp_dir.name)
     process_path = root / "process.json"
     assemble_path = root / "assemble.json"
-    write_process_profile(process_path, settings, orca_process_extras(machine) if machine else None)
-    write_assemble_list(assemble_path, prepared.meshes)
     machine_path = Path(printer.definition_path) if printer.definition_path else None
-    if machine is not None and machine_path is not None and machine_path.is_file():
-        source = json.loads(machine_path.read_text(encoding="utf-8"))
+    source: dict[str, object] = {}
+    if machine_path is not None and machine_path.is_file():
+        loaded = json.loads(machine_path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            source = apply_user_orca_machine_override(loaded, config_dir)
+    machine_name = str(source.get("name") or printer.name)
+    compatible = [machine_name] if machine_name else None
+    write_process_profile(
+        process_path,
+        settings,
+        orca_process_extras(machine) if machine else None,
+        inherits=process_inherits_for_machine(source),
+        compatible_printers=compatible,
+    )
+    write_assemble_list(assemble_path, prepared.meshes)
+    if machine_path is not None and machine_path.is_file() and (machine is not None or source):
         patched = root / "machine.json"
-        patched.write_text(json.dumps(patch_orca_machine(source, machine), indent=2), encoding="utf-8")
+        machine_json = dict(source)
+        if machine is not None:
+            machine_json = patch_orca_machine(machine_json, machine)
+        patched.write_text(json.dumps(machine_json, indent=2), encoding="utf-8")
         printer = _printer_with_machine_path(printer, patched)
     filament = generic_pla(config_dir)
     filament_path = root / "filament.json"
@@ -278,10 +401,11 @@ def _run_orca(
             orca_filament_overrides(machine),
             name=str(machine.get("filament_name") or "Generic PLA"),
             inherits=str(machine.get("filament_inherits") or "fdm_filament_pla"),
+            compatible_printers=compatible,
         )
         filament = filament_path
     elif filament is None:
-        write_filament_profile(filament_path)
+        write_filament_profile(filament_path, compatible_printers=compatible)
         filament = filament_path
     archive = root / "plate.3mf"
     command = build_orca_command(

@@ -47,6 +47,8 @@ ORCA_SEAM_POSITIONS: tuple[OrcaSeam, ...] = (
     "back",
     "random",
 )
+OrcaScarfJoint = Literal["none", "external", "all"]
+ORCA_SCARF_JOINTS: tuple[OrcaScarfJoint, ...] = ("none", "external", "all")
 COMBING_MODES: tuple[CombingMode, ...] = ("off", "all", "noskin", "infill")
 SUPPORT_TYPES: tuple[SupportType, ...] = ("buildplate", "everywhere")
 SUPPORT_STRUCTURES: tuple[SupportStructure, ...] = ("normal", "tree")
@@ -89,6 +91,8 @@ class SliceSettings:
     z_seam_type: SeamType = "user_specified"
     z_seam_position: SeamPosition = "backright"
     orca_seam: OrcaSeam = "back"
+    orca_scarf_joint: OrcaScarfJoint = "external"
+    orca_scarf_conditional: bool = True
     infill_pattern: str = "lightning"
     infill_sparse_density: float = 5.0
     retraction_combing: CombingMode = "noskin"
@@ -101,6 +105,10 @@ class SliceSettings:
     support_structure: SupportStructure = "normal"
     support_angle: float = 50.0
     support_infill_rate: float = 15.0
+    orca_arrange_spacing: float = 0.0
+    orca_arrange_rotate: bool = False
+    orca_arrange_multicolor: bool = True
+    orca_arrange_align_y: bool = True
 
     def validate(self) -> None:
         if self.output_folder_name:
@@ -112,6 +120,7 @@ class SliceSettings:
         _enum(self.z_seam_type, SEAM_TYPES, "z_seam_type")
         _enum(self.z_seam_position, SEAM_POSITIONS, "z_seam_position")
         _enum(self.orca_seam, ORCA_SEAM_POSITIONS, "orca_seam")
+        _enum(self.orca_scarf_joint, ORCA_SCARF_JOINTS, "orca_scarf_joint")
         _enum(self.retraction_combing, COMBING_MODES, "retraction_combing")
         _enum(self.adhesion_type, ADHESION_TYPES, "adhesion_type")
         _enum(self.slicer_engine, SLICER_ENGINES, "slicer_engine")
@@ -123,6 +132,8 @@ class SliceSettings:
             raise ValueError("adhesion sizes cannot be negative")
         if self.support_infill_rate < 0 or self.support_angle < 0:
             raise ValueError("support settings cannot be negative")
+        if self.orca_arrange_spacing < 0:
+            raise ValueError("orca_arrange_spacing cannot be negative")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -225,6 +236,8 @@ def orca_setting_overrides(settings: SliceSettings) -> dict[str, str]:
         "layer_height": _number(settings.layer_height),
         "ironing_type": ironing,
         "seam_position": settings.orca_seam,
+        "seam_slope_type": settings.orca_scarf_joint,
+        "seam_slope_conditional": "1" if settings.orca_scarf_conditional else "0",
         "sparse_infill_pattern": _ORCA_INFILL.get(settings.infill_pattern, settings.infill_pattern),
         "sparse_infill_density": f"{_number(settings.infill_sparse_density)}%",
         "reduce_crossing_wall": "0" if settings.retraction_combing == "off" else "1",

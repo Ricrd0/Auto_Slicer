@@ -107,6 +107,12 @@ def test_browse_folder_and_choose_files(tmp_path: Path, monkeypatch: pytest.Monk
     assert flags["wall.stl"] is True
     assert flags["other.stl"] is False
 
+    cleared = client.put("/api/locations", json={"included": []})
+    assert cleared.status_code == 200
+    none_selected = {model["path"]: model["included"] for model in client.get("/api/models").json()}
+    assert none_selected["wall.stl"] is False
+    assert none_selected["other.stl"] is False
+
     outside = client.get("/api/browse", params={"path": str(tmp_path / "missing")})
     assert outside.status_code == 400
 
