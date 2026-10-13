@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import os
+import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from auto_slicer.browse import gcode_root, model_root
 from auto_slicer.cura_config import PrinterProfile, discover_printers
-from auto_slicer.engine import EngineError, locate_cura
+from auto_slicer.engine import EngineError, SliceCancelled, locate_cura, terminate_slice_process
 from auto_slicer.machine_sync import (
     apply_filaments,
     apply_shared_slice_to_machine,
@@ -20,7 +23,7 @@ from auto_slicer.machine_sync import (
     with_idex_mode_gcode,
     with_synced_bed,
 )
-from auto_slicer.orca_config import active_orca_dir, discover_filaments, discover_orca_printers
+from auto_slicer.orca_config import active_orca_dir, discover_filaments, discover_orca_printers, load_orca_printers
 from auto_slicer.paths import safe_segment
 from auto_slicer.slicing import (
     ensure_group_layout,
@@ -40,9 +43,15 @@ class JobRunner:
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._printer_lock = threading.Lock()
+        self._group_lock = threading.Lock()
+        self._process_lock = threading.Lock()
+        self._cancel = threading.Event()
+        self._active_processes: set[subprocess.Popen[str]] = set()
         self._printer_cache: dict[str, tuple[float, list[PrinterProfile]]] = {}
         self._filament_cache: tuple[float, list[dict[str, Any]]] | None = None
-        self._warming = False
+        self._catalog_state: dict[str, str] = {"cura": "idle", "orca": "idle"}
+        self._catalog_error: dict[str, str | None] = {"cura": None, "orca": None}
+        self._warming: set[str] = set()
 
     # Orca discovery over a host mount can take well over a minute; keep results
     # long enough that boot (health + printers + owned) does not scan three times.
@@ -52,24 +61,34 @@ class JobRunner:
         engine_name = self.store.load_settings().slicer_engine
         if refresh:
             self.clear_printer_cache()
-        if catalog or refresh:
-            cura = self._discovered("cura")
-            orca = self._discovered("orca")
-            owned = self.ensure_owned(cura_printers=cura, orca_printers=orca)
-            found = orca if engine_name == "orca" else cura
-            return printers_for_page(found, owned, engine=engine_name, catalog=catalog)
-
-        # Fast path for the Printers page: never block on a cold Orca catalog scan.
         owned = self.owned_snapshot()
-        found = self.cached_discovered(engine_name)
-        if found is None:
-            self.warm_printer_cache()
-            found = []
+        if catalog:
+            # Full catalog is opt-in ("Show every Orca printer") and may still be warming.
+            found = self.cached_discovered(engine_name)
+            if found is None:
+                self.warm_catalog(engine_name)
+                found = []
+            elif engine_name == "orca":
+                cura = self.cached_discovered("cura") or []
+                owned = self.ensure_owned(cura_printers=cura, orca_printers=found)
+            return printers_for_page(found, owned, engine=engine_name, catalog=True)
+
+        if refresh and engine_name != "orca":
+            found = self._discovered("cura")
+            orca = self.cached_discovered("orca") or []
+            owned = self.ensure_owned(cura_printers=found, orca_printers=orca)
+            return printers_for_page(found, owned, engine=engine_name, catalog=False)
+
+        # Default Printers page: owned machines only. Orca links resolve from disk
+        # by id — never kick off a full catalog scan here.
+        found: list[PrinterProfile] = []
+        if engine_name == "orca":
+            # Heal Marlin→Klipper from user overrides without scanning system machines.
+            owned = sync_owned_with_orca_user_profiles(owned, active_orca_dir())
         else:
-            cura = self.cached_discovered("cura")
-            orca = self.cached_discovered("orca")
-            if cura is not None and orca is not None:
-                owned = self.ensure_owned(cura_printers=cura, orca_printers=orca)
+            found = self.cached_discovered("cura") or []
+            if not found:
+                self.warm_catalog("cura")
         return printers_for_page(found, owned, engine=engine_name, catalog=False)
 
     def owned_snapshot(self) -> list[dict[str, Any]]:
@@ -107,7 +126,9 @@ class JobRunner:
     def clear_printer_cache(self) -> None:
         with self._printer_lock:
             self._printer_cache.clear()
-            self._warming = False
+            self._warming.clear()
+            self._catalog_state = {"cura": "idle", "orca": "idle"}
+            self._catalog_error = {"cura": None, "orca": None}
 
     def cached_discovered(self, engine_name: str) -> list[PrinterProfile] | None:
         with self._printer_lock:
@@ -118,30 +139,71 @@ class JobRunner:
                 return None
             return cached[1]
 
-    def warm_printer_cache(self) -> None:
-        """Discover Cura/Orca catalogs in a daemon thread for later requests."""
+    def catalog_status(self, engine_name: str | None = None) -> dict[str, Any]:
+        engine = engine_name or self.store.load_settings().slicer_engine
         with self._printer_lock:
-            if self._warming:
-                return
-            now = time.monotonic()
-            cura = self._printer_cache.get("cura")
-            orca = self._printer_cache.get("orca")
-            cura_ok = cura is not None and now - cura[0] < self._PRINTER_CACHE_SECONDS
-            orca_ok = orca is not None and now - orca[0] < self._PRINTER_CACHE_SECONDS
-            if cura_ok and orca_ok:
-                return
-            self._warming = True
+            state = self._catalog_state.get(engine, "idle")
+            error = self._catalog_error.get(engine)
+            cached = self._printer_cache.get(engine)
+            cache_ok = (
+                cached is not None
+                and time.monotonic() - cached[0] < self._PRINTER_CACHE_SECONDS
+            )
+            if state == "ready" and not cache_ok:
+                state = "idle"
+            ready = cache_ok and state == "ready"
+            count = len(cached[1]) if cached is not None and ready else 0
+        return {
+            "engine": engine,
+            "state": state,
+            "ready": ready,
+            "loading": state == "loading",
+            "error": error,
+            "count": count,
+        }
+
+    def warm_catalog(self, engine_name: str | None = None) -> dict[str, Any]:
+        """Start a background full catalog scan for Cura or Orca (opt-in for Orca)."""
+        engine = engine_name or self.store.load_settings().slicer_engine
+        with self._printer_lock:
+            cached = self._printer_cache.get(engine)
+            if (
+                cached is not None
+                and time.monotonic() - cached[0] < self._PRINTER_CACHE_SECONDS
+                and self._catalog_state.get(engine) == "ready"
+            ):
+                return self.catalog_status(engine)
+            if engine in self._warming:
+                return self.catalog_status(engine)
+            self._warming.add(engine)
+            self._catalog_state[engine] = "loading"
+            self._catalog_error[engine] = None
 
         def _run() -> None:
             try:
-                self.ensure_owned()
-            except Exception:
-                pass
+                found = self._discovered(engine)
+                if engine == "orca":
+                    cura = self.cached_discovered("cura") or []
+                    self.ensure_owned(cura_printers=cura, orca_printers=found)
+                elif engine == "cura":
+                    orca = self.cached_discovered("orca") or []
+                    self.ensure_owned(cura_printers=found, orca_printers=orca)
+                with self._printer_lock:
+                    self._catalog_state[engine] = "ready"
+            except Exception as exc:
+                with self._printer_lock:
+                    self._catalog_state[engine] = "error"
+                    self._catalog_error[engine] = str(exc)
             finally:
                 with self._printer_lock:
-                    self._warming = False
+                    self._warming.discard(engine)
 
-        threading.Thread(target=_run, name="warm-printer-cache", daemon=True).start()
+        threading.Thread(target=_run, name=f"warm-{engine}-catalog", daemon=True).start()
+        return self.catalog_status(engine)
+
+    def warm_printer_cache(self) -> None:
+        """Deprecated no-op: full Orca catalog warms only via Show every Orca printer."""
+        return
 
     def _discovered(self, engine_name: str) -> list[PrinterProfile]:
         with self._printer_lock:
@@ -158,7 +220,17 @@ class JobRunner:
             found = discover_printers(self.store.paths.cura_config_dir, resources)
         with self._printer_lock:
             self._printer_cache[engine_name] = (time.monotonic(), found)
+            if engine_name not in self._warming:
+                self._catalog_state[engine_name] = "ready"
             return found
+
+    def resolve_owned_orca(self, owned: list[dict[str, Any]] | None = None) -> list[PrinterProfile]:
+        """Load only the Orca profiles linked from owned printers."""
+        records = owned if owned is not None else self.owned_snapshot()
+        ids = {str(item["orca_id"]) for item in records if item.get("orca_id")}
+        if not ids:
+            return []
+        return load_orca_printers(active_orca_dir(), only_ids=ids)
 
     def filament_catalog(self) -> list[dict[str, Any]]:
         with self._printer_lock:
@@ -183,6 +255,21 @@ class JobRunner:
             raise ValueError("item_type must be model or group")
         return self._start("test", printer_id, (item_type, item_name))
 
+    def stop(self) -> dict[str, Any]:
+        """Stop the current batch/test job and kill active slicer processes."""
+        self._cancel.set()
+        with self._process_lock:
+            processes = list(self._active_processes)
+        for process in processes:
+            terminate_slice_process(process)
+        job = self.store.latest_job()
+        if job is not None and job.get("status") in {"queued", "running"}:
+            self.store.cancel_open_items(str(job["id"]))
+            self.store.update_job(str(job["id"]), "stopped", finished=True)
+            refreshed = self.store.job_record(str(job["id"]))
+            return refreshed or job
+        return job or {}
+
     def _start(
         self,
         kind: str,
@@ -192,6 +279,7 @@ class JobRunner:
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 raise RuntimeError("a slice is already running")
+            self._cancel.clear()
             settings = self.store.load_settings()
             folder = safe_segment(settings.output_folder_name)
             printers = [printer for printer in self.printers() if self._included(printer, printer_id)]
@@ -300,15 +388,33 @@ class JobRunner:
         shared_filament = _selected_filament(filament_library)
         poses = self.store.load_poses()
         groups = {str(group["id"]): group for group in self.store.load_groups()}
+        workers = slice_worker_count(len(work))
         failures = 0
-        for item_id, printer, item_type, item_key, output_rel, mode in work:
+        cancelled = 0
+
+        def _track_start(process: subprocess.Popen[str]) -> None:
+            with self._process_lock:
+                self._active_processes.add(process)
+
+        def _track_finish(process: subprocess.Popen[str]) -> None:
+            with self._process_lock:
+                self._active_processes.discard(process)
+
+        def _one(task: tuple[int, PrinterProfile, str, str, str, str | None]) -> str:
+            item_id, printer, item_type, item_key, output_rel, mode = task
+            if self._cancel.is_set():
+                self.store.update_item(
+                    item_id, status="cancelled", progress="stopped", error=None
+                )
+                return "cancelled"
             self.store.update_item(item_id, status="running", progress="starting")
             prepared = None
             try:
                 record = owned_for_printer(printer, owned)
                 machine = machine_for_engine(record, printer.engine) if record else None
+                active_printer = printer
                 if machine is not None:
-                    printer = with_synced_bed(printer, machine)
+                    active_printer = with_synced_bed(printer, machine)
                     filament_t1 = _filament_by_id(
                         filament_library, machine.get("filament_id_t1")
                     )
@@ -319,24 +425,32 @@ class JobRunner:
                     layout = layout_for_model(
                         model_root(self.store),
                         item_key,
-                        printer,
+                        active_printer,
                         settings,
                         poses.get(item_key),
                         machine if isinstance(machine, dict) else None,
                     )
                 else:
-                    group = groups[item_key]
-                    layout, dirty = ensure_group_layout(
-                        model_root(self.store),
-                        group,
-                        printer,
-                        settings,
-                        poses,
-                        machine if isinstance(machine, dict) else None,
+                    with self._group_lock:
+                        group = groups[item_key]
+                        layout, dirty = ensure_group_layout(
+                            model_root(self.store),
+                            group,
+                            active_printer,
+                            settings,
+                            poses,
+                            machine if isinstance(machine, dict) else None,
+                        )
+                        if dirty:
+                            self.store.save_groups(list(groups.values()))
+                if self._cancel.is_set():
+                    self.store.update_item(
+                        item_id, status="cancelled", progress="stopped", error=None
                     )
-                    if dirty:
-                        self.store.save_groups(list(groups.values()))
-                prepared = prepare_slice(model_root(self.store), printer, layout, settings)
+                    return "cancelled"
+                prepared = prepare_slice(
+                    model_root(self.store), active_printer, layout, settings
+                )
                 output = gcode_root(self.store) / output_rel
 
                 def progress(line: str, current: int = item_id) -> None:
@@ -344,13 +458,21 @@ class JobRunner:
 
                 seconds, filament = run_prepared_slice(
                     self.store.paths,
-                    printer,
+                    active_printer,
                     settings,
                     prepared,
                     output,
                     progress,
                     machine if isinstance(machine, dict) else None,
+                    should_cancel=self._cancel.is_set,
+                    on_process_start=_track_start,
+                    on_process_finish=_track_finish,
                 )
+                if self._cancel.is_set():
+                    self.store.update_item(
+                        item_id, status="cancelled", progress="stopped", error=None
+                    )
+                    return "cancelled"
                 self.store.update_item(
                     item_id,
                     status="done",
@@ -359,14 +481,66 @@ class JobRunner:
                     filament_meters=filament,
                     error=None,
                 )
+                return "done"
+            except SliceCancelled:
+                self.store.update_item(
+                    item_id, status="cancelled", progress="stopped", error=None
+                )
+                return "cancelled"
             except (EngineError, OSError, ValueError, KeyError) as exc:
-                failures += 1
-                self.store.update_item(item_id, status="failed", error=str(exc), progress=None)
+                self.store.update_item(
+                    item_id, status="failed", error=str(exc), progress=None
+                )
+                return "failed"
             finally:
                 if prepared is not None:
                     prepared.temp_dir.cleanup()
+
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [pool.submit(_one, task) for task in work]
+                for future in as_completed(futures):
+                    result = future.result()
+                    if result == "failed":
+                        failures += 1
+                    elif result == "cancelled":
+                        cancelled += 1
+                    if self._cancel.is_set():
+                        for pending in futures:
+                            pending.cancel()
+        finally:
+            with self._process_lock:
+                leftover = list(self._active_processes)
+                self._active_processes.clear()
+            for process in leftover:
+                terminate_slice_process(process)
+
+        if self._cancel.is_set() or cancelled:
+            self.store.cancel_open_items(job_id)
+            self.store.update_job(job_id, "stopped", finished=True)
+            return
         status = "completed" if failures == 0 else "completed_with_errors"
         self.store.update_job(job_id, status, finished=True)
+
+
+def slice_worker_count(work_items: int) -> int:
+    """How many slicer processes to run at once.
+
+    Each Orca/Cura invocation is already multi-threaded, so we overlap a few jobs
+    to hide ramp-up/I/O without oversubscribing the machine. Override with
+    ``AUTO_SLICER_SLICE_WORKERS``.
+    """
+    if work_items <= 1:
+        return 1
+    raw = os.environ.get("AUTO_SLICER_SLICE_WORKERS", "").strip()
+    if raw:
+        try:
+            return max(1, min(work_items, int(raw)))
+        except ValueError:
+            pass
+    cpus = os.cpu_count() or 4
+    # ~one concurrent slicer per 4 cores, capped so heavy Orca jobs still breathe.
+    return max(2, min(work_items, 4, max(1, cpus // 4)))
 
 
 def _selected_filament(library: dict[str, Any]) -> dict[str, Any] | None:

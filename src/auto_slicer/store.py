@@ -156,6 +156,20 @@ class Store:
             )
             self._db.commit()
 
+    def cancel_open_items(self, job_id: str) -> int:
+        """Mark queued/running items as cancelled. Returns how many rows changed."""
+        with self._lock:
+            cursor = self._db.execute(
+                """
+                UPDATE job_items
+                SET status = 'cancelled', progress = 'stopped', error = NULL
+                WHERE job_id = ? AND status IN ('queued', 'running')
+                """,
+                (job_id,),
+            )
+            self._db.commit()
+            return int(cursor.rowcount)
+
     def job_record(self, job_id: str) -> dict[str, Any] | None:
         with self._lock:
             row = self._db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
@@ -251,8 +265,9 @@ class Store:
         return payload
 
     def _write_json(self, path: Path, payload: object) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        with self._lock:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def _normalize_group(group: dict[str, Any]) -> dict[str, Any]:

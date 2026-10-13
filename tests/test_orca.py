@@ -10,6 +10,8 @@ from auto_slicer.orca_config import (
     discover_filaments,
     discover_orca_printers,
     extract_plate_gcode,
+    find_orca_machine_file,
+    load_orca_printer,
     process_inherits_for_machine,
     search_filaments,
     write_assemble_list,
@@ -55,6 +57,25 @@ def test_orca_discovery_keeps_single_extruder_machines(tmp_path: Path) -> None:
     assert printers["Twin"].slicable
     assert printers["Twin"].extruder_count == 2
     assert not printers["Triple"].slicable
+
+
+def test_owned_orca_printer_resolves_without_full_catalog(tmp_path: Path) -> None:
+    system = tmp_path / "system" / "Creality" / "machine"
+    _machine(system, "Creality Ender-3 0.4 nozzle", printable_height="250")
+    located = find_orca_machine_file(tmp_path, "Creality Ender-3 0.4 nozzle", include_bundled=False)
+    assert located is not None
+    profile = load_orca_printer(
+        tmp_path,
+        "orca:Creality Ender-3 0.4 nozzle",
+        include_bundled=False,
+        display_name="Shop Ender",
+        bed=(220.0, 220.0, 250.0),
+    )
+    assert profile is not None
+    assert profile.slicable
+    assert profile.name == "Shop Ender"
+    assert profile.definition_path.endswith("Creality Ender-3 0.4 nozzle.json")
+    assert profile.machine_width == 220.0
 
 
 def test_filament_temperatures_follow_the_inherited_bed_type(tmp_path: Path) -> None:

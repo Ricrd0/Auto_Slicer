@@ -174,8 +174,12 @@ def test_printers_page_includes_owned_without_engine_link() -> None:
     cold = printers_for_page([], owned, engine="orca")
     assert [printer.name for printer in cold] == ["Tenlog TL-D3 Pro", "Shop Ender"]
     assert cold[1].id == "orca:Creality Ender-3 0.4 nozzle"
-    assert not cold[1].slicable
-    assert cold[1].machine_width is None or True  # bed from owned defaults after normalize
+    # Linked Orca printers resolve from disk by id — no full catalog required.
+    if cold[1].definition_path:
+        assert cold[1].slicable
+    else:
+        assert cold[1].error
+        assert not cold[1].slicable
 
 
 def _printer(name: str, engine: str = "orca", **extra: object) -> PrinterProfile:

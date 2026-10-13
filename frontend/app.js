@@ -791,6 +791,46 @@ async function loadPrinters({ refresh = false } = {}) {
   renderPrinters();
 }
 
+function setOrcaCatalogStatus(status) {
+  const el = $("orca-catalog-status");
+  if (!el) return;
+  if (!status || status === "idle" || !state.orcaCatalog) {
+    el.hidden = true;
+    el.className = "catalog-status";
+    el.textContent = "";
+    el.title = "";
+    return;
+  }
+  el.hidden = false;
+  el.className = `catalog-status ${status}`;
+  el.textContent = "";
+  if (status === "loading") el.title = "Loading Orca catalog…";
+  else if (status === "ready") el.title = "Orca catalog ready";
+  else if (status === "error") el.title = "Orca catalog failed to load";
+}
+
+async function ensureOrcaCatalogLoaded() {
+  setOrcaCatalogStatus("loading");
+  state.catalogPollToken += 1;
+  const token = state.catalogPollToken;
+  let status = await api("/api/printers/catalog", { method: "POST" });
+  for (let attempt = 0; attempt < 120 && token === state.catalogPollToken; attempt += 1) {
+    if (status.ready) {
+      setOrcaCatalogStatus("ready");
+      return true;
+    }
+    if (status.state === "error") {
+      setOrcaCatalogStatus("error");
+      return false;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    if (token !== state.catalogPollToken) return false;
+    status = await api("/api/printers/catalog");
+  }
+  if (token === state.catalogPollToken) setOrcaCatalogStatus(status?.ready ? "ready" : "error");
+  return Boolean(status?.ready);
+}
+
 function renderPrinters() {
   const notice = $("printer-notice");
   const engine = state.settings?.slicer_engine || "cura";
@@ -825,7 +865,10 @@ function renderPrinters() {
     const row = document.createElement("tr");
     const notes = [printer.error, ...(printer.warnings || [])].filter(Boolean).join(" ");
     const canAdd = engine === "orca" && state.orcaCatalog && !ownedIds.has(printer.id);
-    row.innerHTML = `<td><input type="checkbox" ${printer.enabled ? "checked" : ""} ${printer.slicable ? "" : "disabled"}></td>
+    const useTitle = printer.slicable
+      ? ""
+      : ' title="Cannot slice yet — you can still choose whether to use this printer."';
+    row.innerHTML = `<td><input type="checkbox" ${printer.enabled ? "checked" : ""}${useTitle}></td>
       <td>${printer.name}</td>
       <td>${printer.machine_width ?? "?"} × ${printer.machine_depth ?? "?"} × ${printer.machine_height ?? "?"}</td>
       <td class="${printer.error ? "" : "muted"}">${notes}</td>
@@ -843,6 +886,7 @@ function renderPrinters() {
         method: "PUT",
         body: JSON.stringify({ id: printer.id, enabled: event.target.checked }),
       });
+      printer.enabled = event.target.checked;
     });
     body.append(row);
   }
@@ -1142,8 +1186,16 @@ function selectJobRow(body, row) {
   row.classList.add("selected");
 }
 
+function jobIsActive(job) {
+  return job && (job.status === "queued" || job.status === "running");
+}
+
 function renderJob(job) {
   $("job-status").textContent = job && job.status ? `${job.kind} ${job.status}` : "No job yet";
+  const stop = $("stop-batch");
+  if (stop) stop.disabled = !jobIsActive(job);
+  const start = $("start-batch");
+  if (start) start.disabled = jobIsActive(job);
   const body = $("job-rows");
   body.innerHTML = "";
   const errorBox = $("job-error");
@@ -2195,6 +2247,24 @@ $("filament-add").addEventListener("click", async () => {
 
 $("orca-catalog").addEventListener("change", async (event) => {
   state.orcaCatalog = event.target.checked;
+  if (!state.orcaCatalog) {
+    state.catalogPollToken += 1;
+    setOrcaCatalogStatus("idle");
+    await loadPrinters();
+    return;
+  }
+  const ready = await ensureOrcaCatalogLoaded();
+  if (!state.orcaCatalog) return;
+  if (ready) {
+    const owned = await api("/api/owned");
+    state.owned = {
+      ...owned,
+      printers: ownedFormDirty()
+        ? mergeOwnedPrinterLists(state.owned.printers, owned.printers)
+        : owned.printers,
+    };
+    renderOwned({ rebuildForm: !ownedFormDirty() });
+  }
   await loadPrinters();
 });
 
@@ -2390,6 +2460,17 @@ $("start-batch").addEventListener("click", async () => {
     $("job-status").textContent = error.message;
   }
 });
+$("stop-batch").addEventListener("click", async () => {
+  $("stop-batch").disabled = true;
+  try {
+    const job = await api("/api/jobs/stop", { method: "POST" });
+    renderJob(job);
+    pollJob();
+  } catch (error) {
+    $("job-status").textContent = error.message;
+    $("stop-batch").disabled = false;
+  }
+});
 $("layer-slider").addEventListener("input", (event) => drawLayer(Number(event.target.value)));
 $("show-travel").addEventListener("change", () => drawLayer(Number($("layer-slider").value)));
 
@@ -2399,7 +2480,7 @@ function pollJob() {
   pollTimer = setInterval(async () => {
     const job = await api("/api/jobs/current");
     renderJob(job);
-    if (!job.status || job.status === "completed" || job.status === "completed_with_errors") {
+    if (!jobIsActive(job)) {
       clearInterval(pollTimer);
     }
   }, 1000);
@@ -2443,7 +2524,7 @@ try {
   renderFilaments();
 
   const [printers, owned] = await Promise.all([
-    api(`/api/printers${state.settings?.slicer_engine === "orca" && state.orcaCatalog ? "?catalog=true" : ""}`),
+    api("/api/printers"),
     api("/api/owned"),
   ]);
   state.printers = printers;
@@ -2451,54 +2532,14 @@ try {
   if (!state.selectedOwnedId && owned.printers?.[0]) {
     state.selectedOwnedId = owned.printers[0].id;
   }
-  const engineLabel = `${curaReady ? "CuraEngine ready" : "CuraEngine was not found"} · ${early[0].orca_engine ? "OrcaSlicer ready" : "OrcaSlicer was not found"}`;
-  const catalogLoading = printers.some((printer) => (printer.warnings || []).some((warning) => /catalog still loading|profile details still loading/i.test(warning)));
-  $("engine-status").textContent = catalogLoading ? `${engineLabel} · Loading Orca catalog…` : engineLabel;
+  $("engine-status").textContent = `${curaReady ? "CuraEngine ready" : "CuraEngine was not found"} · ${early[0].orca_engine ? "OrcaSlicer ready" : "OrcaSlicer was not found"}`;
+  setOrcaCatalogStatus("idle");
   renderPrinters();
   renderOwned();
   await showLayout();
   if (early[7].status === "running" || early[7].status === "queued") pollJob();
-  if (catalogLoading) {
-    state.catalogPollToken += 1;
-    pollCatalogReady(engineLabel, state.catalogPollToken);
-  }
 } catch (error) {
   $("engine-status").textContent = `Failed to load: ${error.message || error}`;
-}
-
-async function pollCatalogReady(engineLabel, token, attempt = 0) {
-  if (token !== state.catalogPollToken || attempt > 36) {
-    if (token === state.catalogPollToken) $("engine-status").textContent = engineLabel;
-    return;
-  }
-  await new Promise((resolve) => setTimeout(resolve, 5000));
-  if (token !== state.catalogPollToken) return;
-  try {
-    // Refresh the Printers page only — do not rebuild the printer-settings form
-    // (that was wiping edits and fighting the selected printer).
-    await loadPrinters({ refresh: false });
-    const owned = await api("/api/owned");
-    if (token !== state.catalogPollToken) return;
-    state.owned = {
-      ...owned,
-      printers: ownedFormDirty()
-        ? mergeOwnedPrinterLists(state.owned.printers, owned.printers)
-        : owned.printers,
-      orca_profiles: owned.orca_profiles,
-    };
-    renderOwned({ rebuildForm: false });
-    refreshOrcaProfileSelect();
-    const stillLoading = state.printers.some((printer) =>
-      (printer.warnings || []).some((warning) => /catalog still loading|profile details still loading/i.test(warning))
-    );
-    if (stillLoading) {
-      $("engine-status").textContent = `${engineLabel} · Loading Orca catalog…`;
-      return pollCatalogReady(engineLabel, token, attempt + 1);
-    }
-    $("engine-status").textContent = engineLabel;
-  } catch {
-    if (token === state.catalogPollToken) $("engine-status").textContent = engineLabel;
-  }
 }
 
 function refreshOrcaProfileSelect() {

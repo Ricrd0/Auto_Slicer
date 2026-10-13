@@ -4,6 +4,7 @@ import json
 import math
 import os
 import re
+import time
 import zipfile
 from pathlib import Path
 
@@ -73,26 +74,118 @@ def bundled_orca_profiles_dir() -> Path | None:
 def discover_orca_printers(
     config_dir: Path | None, *, include_bundled: bool = True
 ) -> list[PrinterProfile]:
-    found: dict[str, PrinterProfile] = {}
-    roots: list[Path] = []
-    if config_dir is not None and config_dir.is_dir():
-        roots.append(config_dir)
-    if include_bundled:
-        bundled = bundled_orca_profiles_dir()
-        if bundled is not None and bundled not in roots:
-            roots.append(bundled)
-    for root in roots:
-        for kind in ("system", "user"):
-            for path in _machine_jsons(root / kind):
-                profile = _load_machine(path, root)
-                if profile is not None:
-                    found[profile.name] = profile
-        # Vendor packs live directly under the root (Anycubic/, Custom/, …).
-        for path in _machine_jsons(root):
+    return load_orca_printers(config_dir, include_bundled=include_bundled)
+
+
+def load_orca_printers(
+    config_dir: Path | None,
+    *,
+    include_bundled: bool = True,
+    only_ids: set[str] | None = None,
+) -> list[PrinterProfile]:
+    """Load Orca machine profiles.
+
+    When ``only_ids`` is set (e.g. ``{"orca:Creality Ender-3 0.4 nozzle"}``), only
+    those machines are resolved — used for the owned-printers list so the UI does
+    not wait on a full catalog scan.
+    """
+    if only_ids is not None:
+        found: dict[str, PrinterProfile] = {}
+        for orca_id in only_ids:
+            profile = load_orca_printer(config_dir, orca_id, include_bundled=include_bundled)
+            if profile is not None:
+                found[profile.id] = profile
+        return [found[key] for key in sorted(found)]
+    found_by_name: dict[str, PrinterProfile] = {}
+    for root in _orca_profile_roots(config_dir, include_bundled=include_bundled):
+        for path in _iter_machine_paths(root):
             profile = _load_machine(path, root)
             if profile is not None:
-                found[profile.name] = profile
-    return [found[name] for name in sorted(found)]
+                found_by_name[profile.name] = profile
+    return [found_by_name[name] for name in sorted(found_by_name)]
+
+
+def load_orca_printer(
+    config_dir: Path | None,
+    orca_id: str,
+    *,
+    include_bundled: bool = True,
+    display_name: str | None = None,
+    bed: tuple[float | None, float | None, float | None] | None = None,
+    extruder_count: int | None = None,
+) -> PrinterProfile | None:
+    """Resolve one linked Orca profile without building the full catalog.
+
+    Uses a direct vendor/path guess (then a filename scan) so owned printers stay
+    slicable while "Show every Orca printer" remains untouched. Inheritance is
+    applied later at slice time from ``definition_path``.
+    """
+    catalog_name = str(orca_id or "").removeprefix("orca:").strip()
+    if not catalog_name:
+        return None
+    located = find_orca_machine_file(config_dir, catalog_name, include_bundled=include_bundled)
+    if located is None:
+        return None
+    path, root = located
+    width = depth = height = None
+    nozzles = extruder_count or 1
+    if bed is not None:
+        width, depth, height = bed
+    data = _read_json(path)
+    if isinstance(data, dict):
+        raw_nozzles = data.get("nozzle_diameter")
+        if isinstance(raw_nozzles, list) and raw_nozzles:
+            nozzles = len(raw_nozzles)
+        if width is None or depth is None:
+            area_bed = _bed_size(data.get("printable_area"))
+            if area_bed is not None:
+                width, depth = area_bed
+        if height is None:
+            height = _float_or_none(data.get("printable_height"))
+    error = None
+    if nozzles > 2:
+        error = f"at most two extruders are supported; this machine has {nozzles}"
+    display = display_name or orca_display_name(catalog_name)
+    return PrinterProfile(
+        id=f"orca:{catalog_name}",
+        name=display,
+        definition_id=catalog_name,
+        definition_path=str(path),
+        extruder_definition_id=None,
+        extruder_definition_path=None,
+        global_settings=[],
+        extruder_settings=[],
+        machine_width=width,
+        machine_depth=depth,
+        machine_height=height,
+        machine_center_is_zero=False,
+        extruder_count=max(1, nozzles),
+        setting_version=None,
+        resource_setting_version=None,
+        error=error,
+        engine="orca",
+        config_root=str(root),
+    )
+
+
+def find_orca_machine_file(
+    config_dir: Path | None,
+    catalog_name: str,
+    *,
+    include_bundled: bool = True,
+) -> tuple[Path, Path] | None:
+    """Return ``(machine.json path, config root)`` for a catalog machine name."""
+    if not catalog_name:
+        return None
+    filename = f"{catalog_name}.json"
+    for root in _orca_profile_roots(config_dir, include_bundled=include_bundled):
+        direct = _direct_machine_path(root, catalog_name)
+        if direct is not None:
+            return direct, root
+        for path in _iter_machine_paths(root):
+            if path.name == filename or path.stem == catalog_name:
+                return path, root
+    return None
 
 
 def user_orca_machine_override(config_dir: Path | None, base_name: str) -> dict[str, object] | None:
@@ -427,7 +520,7 @@ def resolve_orca_machine(
     """Merge ``inherits`` parents so bed size and flavor are visible on nozzle presets."""
     if config_dir is None:
         return dict(data)
-    indexed = _machine_profile_index(config_dir)
+    indexed = _cached_machine_profile_index(config_dir)
     return _resolve_machine_data(data, indexed, set())
 
 
@@ -436,6 +529,66 @@ def orca_display_name(name: str) -> str:
     if re.match(r"(?i)^snapmaker\s+j1(\b|$)", name.strip()):
         return "Snapmaker J1S"
     return name
+
+
+def _orca_profile_roots(config_dir: Path | None, *, include_bundled: bool) -> list[Path]:
+    roots: list[Path] = []
+    if config_dir is not None and config_dir.is_dir():
+        roots.append(config_dir)
+    if include_bundled:
+        bundled = bundled_orca_profiles_dir()
+        if bundled is not None and bundled not in roots:
+            roots.append(bundled)
+    return roots
+
+
+def _direct_machine_path(root: Path, catalog_name: str) -> Path | None:
+    """Prefer a vendor/folder guess so owned printers skip a full catalog walk."""
+    if not catalog_name:
+        return None
+    filename = f"{catalog_name}.json"
+    vendor = catalog_name.split()[0]
+    candidates: list[Path] = []
+    for kind in ("system", "user"):
+        if vendor:
+            candidates.append(root / kind / vendor / "machine" / filename)
+        candidates.append(root / kind / "default" / "machine" / filename)
+    if vendor:
+        candidates.append(root / vendor / "machine" / filename)
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _iter_machine_paths(root: Path) -> list[Path]:
+    paths: list[Path] = []
+    for kind in ("system", "user"):
+        paths.extend(_machine_jsons(root / kind))
+    paths.extend(_machine_jsons(root))
+    return paths
+
+
+def _machine_catalog_name(path: Path) -> str:
+    data = _read_json(path)
+    if data is not None and data.get("name"):
+        return str(data["name"])
+    return path.stem
+
+
+_MACHINE_INDEX_CACHE: dict[str, tuple[float, dict[str, dict[str, object]]]] = {}
+_MACHINE_INDEX_TTL = 300.0
+
+
+def _cached_machine_profile_index(config_dir: Path) -> dict[str, dict[str, object]]:
+    key = str(config_dir)
+    now = time.monotonic()
+    cached = _MACHINE_INDEX_CACHE.get(key)
+    if cached is not None and now - cached[0] < _MACHINE_INDEX_TTL:
+        return cached[1]
+    indexed = _machine_profile_index(config_dir)
+    _MACHINE_INDEX_CACHE[key] = (now, indexed)
+    return indexed
 
 
 def _load_machine(path: Path, config_dir: Path) -> PrinterProfile | None:

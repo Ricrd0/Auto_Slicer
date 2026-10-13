@@ -32,7 +32,7 @@
       <h2>Printers</h2>
       <div class="toolbar">
         <button type="button" id="refresh-printers">Refresh</button>
-        <label class="inline" id="show-all-orca"><input id="orca-catalog" type="checkbox"> Show every Orca printer</label>
+        <label class="inline" id="show-all-orca"><input id="orca-catalog" type="checkbox"> Show every Orca printer <span id="orca-catalog-status" class="catalog-status" hidden aria-live="polite"></span></label>
         <a id="download-all" href="/api/bundles">Download all</a>
         <label class="file-button">Upload bundle<input id="upload-bundle" type="file" accept=".zip"></label>
       </div>
@@ -133,6 +133,7 @@
       <h2>Slice and results</h2>
       <div class="toolbar">
         <button type="button" id="start-batch" class="primary">Slice all printers</button>
+        <button type="button" id="stop-batch" disabled>Stop</button>
         <span id="job-status" class="muted"></span>
       </div>
       <div class="table-wrap">

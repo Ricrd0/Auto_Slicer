@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
@@ -12,6 +13,10 @@ from auto_slicer.settings_schema import SliceSettings, cura_setting_overrides
 
 class EngineError(RuntimeError):
     pass
+
+
+class SliceCancelled(EngineError):
+    """Raised when the user stops a running slice job."""
 
 
 def locate_cura(paths: DataPaths) -> tuple[Path | None, Path | None, str]:
@@ -93,6 +98,10 @@ def run_slice(
     command: list[str],
     library_path: str,
     on_progress: Callable[[str], None] | None = None,
+    *,
+    should_cancel: Callable[[], bool] | None = None,
+    on_start: Callable[[subprocess.Popen[str]], None] | None = None,
+    on_finish: Callable[[subprocess.Popen[str]], None] | None = None,
 ) -> tuple[int, str]:
     env = os.environ.copy()
     if library_path:
@@ -106,18 +115,62 @@ def run_slice(
         text=True,
         encoding="utf-8",
         errors="replace",
+        start_new_session=True,
     )
+    if on_start is not None:
+        on_start(process)
     lines: list[str] = []
-    assert process.stdout is not None
-    for line in process.stdout:
-        stripped = line.rstrip()
-        if stripped:
-            lines.append(stripped)
-            lines = lines[-200:]
-            if on_progress is not None and "progress" in stripped.lower():
-                on_progress(stripped)
-    code = process.wait()
+    cancelled = False
+    try:
+        assert process.stdout is not None
+        for line in process.stdout:
+            if should_cancel is not None and should_cancel():
+                cancelled = True
+                terminate_slice_process(process)
+                break
+            stripped = line.rstrip()
+            if stripped:
+                lines.append(stripped)
+                lines = lines[-200:]
+                if on_progress is not None and "progress" in stripped.lower():
+                    on_progress(stripped)
+        code = process.wait()
+    finally:
+        if on_finish is not None:
+            on_finish(process)
+    if cancelled or (should_cancel is not None and should_cancel()):
+        raise SliceCancelled("slice stopped")
     return code, _summarize_engine_output(lines, code)
+
+
+def terminate_slice_process(process: subprocess.Popen[str] | subprocess.Popen[bytes]) -> None:
+    """Stop a slicer process and its children (Orca/Cura spawn worker threads/processes)."""
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            process.terminate()
+        else:
+            os.killpg(process.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            process.kill()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            if os.name == "nt":
+                process.kill()
+            else:
+                os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 def _summarize_engine_output(lines: list[str], code: int) -> str:

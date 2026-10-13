@@ -8,3 +8,5 @@ data/output/**
 data/cura-config/**
 data/app/**
 !data/**/.gitkeep
+*.stl
+/data/temp

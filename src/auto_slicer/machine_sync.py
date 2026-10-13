@@ -7,9 +7,11 @@ from pathlib import Path
 
 from auto_slicer.cura_config import PrinterProfile
 from auto_slicer.orca_config import (
+    active_orca_dir,
     area_is_center_zero,
     apply_user_orca_machine_override,
     circular_printable_area,
+    load_orca_printer,
     orca_display_name,
     resolve_orca_machine,
     user_orca_machine_override,
@@ -696,8 +698,8 @@ def printers_for_page(
     """Printers page list: owned machines, using the linked engine profile when present.
 
     Unlinked owned printers still appear (with a note) so Cura-only machines show
-    under Orca and Orca-only machines show under Cura. Linked printers whose
-    catalog entry is not loaded yet still appear from saved bed settings.
+    under Orca and Orca-only machines show under Cura. Linked Orca printers are
+    resolved from disk by id (no full catalog scan) when the catalog list is empty.
     """
     if catalog:
         return list(discovered)
@@ -714,9 +716,24 @@ def printers_for_page(
             result.append(replace(printer, name=name))
             linked.add(str(link_id))
             continue
+        if link_id and engine == "orca":
+            resolved = _resolve_owned_orca_link(str(link_id), name, settings)
+            if resolved is not None:
+                result.append(resolved)
+                linked.add(str(link_id))
+                continue
+            result.append(
+                _owned_stub_profile(
+                    str(link_id),
+                    name,
+                    settings,
+                    engine=engine,
+                    error="Orca machine profile file was not found.",
+                )
+            )
+            linked.add(str(link_id))
+            continue
         if link_id:
-            # Keep the engine profile id so enable/slice keys stay stable while the
-            # catalog is still loading in the background.
             result.append(
                 _owned_stub_profile(
                     str(link_id),
@@ -725,10 +742,8 @@ def printers_for_page(
                     engine=engine,
                     error=None,
                     warnings=(
-                        ["Orca catalog still loading — bed size from saved settings."]
-                        if engine == "orca" and not discovered
-                        else ["Cura profile details still loading — bed size from saved settings."]
-                        if engine != "orca" and not discovered
+                        ["Cura profile details still loading — bed size from saved settings."]
+                        if not discovered
                         else []
                     ),
                 )
@@ -754,6 +769,24 @@ def printers_for_page(
             if printer.id not in linked:
                 result.append(printer)
     return result
+
+
+def _resolve_owned_orca_link(
+    orca_id: str, name: str, settings: dict[str, object]
+) -> PrinterProfile | None:
+    bed_width = float(settings["bed_width"]) if settings.get("bed_width") not in (None, "") else None
+    bed_depth = float(settings["bed_depth"]) if settings.get("bed_depth") not in (None, "") else None
+    bed_height = float(settings["bed_height"]) if settings.get("bed_height") not in (None, "") else None
+    extruders = None
+    if settings.get("extruder_count") not in (None, ""):
+        extruders = max(1, int(float(settings["extruder_count"])))
+    return load_orca_printer(
+        active_orca_dir(),
+        orca_id,
+        display_name=name,
+        bed=(bed_width, bed_depth, bed_height),
+        extruder_count=extruders,
+    )
 
 
 def _owned_stub_profile(

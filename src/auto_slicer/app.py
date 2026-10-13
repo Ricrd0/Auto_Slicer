@@ -120,10 +120,6 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
         store.save_settings(settings)
         return settings.to_dict()
 
-    @app.on_event("startup")
-    def _warm_printers() -> None:
-        runner.warm_printer_cache()
-
     @app.get("/api/printers")
     def get_printers(catalog: bool = False, refresh: bool = False) -> list[dict[str, object]]:
         enabled = store.load_enabled()
@@ -131,6 +127,15 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
             printer.to_public_dict(enabled.get(printer.id, True))
             for printer in runner.printers(catalog=catalog, refresh=refresh)
         ]
+
+    @app.get("/api/printers/catalog")
+    def get_printer_catalog_status() -> dict[str, object]:
+        return runner.catalog_status()
+
+    @app.post("/api/printers/catalog")
+    def start_printer_catalog() -> dict[str, object]:
+        """Begin a full Orca/Cura catalog scan (Show every Orca printer)."""
+        return runner.warm_catalog()
 
     @app.get("/api/owned")
     def get_owned(refresh: bool = False) -> dict[str, object]:
@@ -142,7 +147,9 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
             owned = runner.owned_snapshot()
             cura = runner.cached_discovered("cura") or []
             orca = runner.cached_discovered("orca") or []
-            runner.warm_printer_cache()
+            if not orca:
+                # Dropdown can list linked profiles without a full catalog warm.
+                orca = runner.resolve_owned_orca(owned)
         return {
             "printers": _with_profile_names(owned, cura, orca),
             "orca_profiles": [{"id": printer.id, "name": printer.name} for printer in orca],
@@ -571,6 +578,10 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
             return runner.start_batch()
         except (RuntimeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/jobs/stop")
+    def stop_job() -> dict[str, object]:
+        return runner.stop()
 
     @app.post("/api/test")
     def start_test(payload: dict[str, object]) -> dict[str, object]:

@@ -452,9 +452,23 @@ def run_prepared_slice(
     output: Path,
     on_progress: Any = None,
     machine: dict[str, object] | None = None,
+    *,
+    should_cancel: Any = None,
+    on_process_start: Any = None,
+    on_process_finish: Any = None,
 ) -> tuple[int | None, float | None]:
     if settings.slicer_engine == "orca":
-        return _run_orca(printer, settings, prepared, output, on_progress, machine)
+        return _run_orca(
+            printer,
+            settings,
+            prepared,
+            output,
+            on_progress,
+            machine,
+            should_cancel=should_cancel,
+            on_process_start=on_process_start,
+            on_process_finish=on_process_finish,
+        )
     engine, resources, library_path = locate_cura(paths)
     if engine is None or resources is None:
         raise EngineError("CuraEngine was not found. Build the Docker image or set CURA_ENGINE and CURA_RESOURCES.")
@@ -476,7 +490,14 @@ def run_prepared_slice(
         # the command's second extruder block temperatures below.
         command = _apply_cura_t1_temps(command, machine)
     output.parent.mkdir(parents=True, exist_ok=True)
-    code, tail = run_slice(command, library_path, on_progress)
+    code, tail = run_slice(
+        command,
+        library_path,
+        on_progress,
+        should_cancel=should_cancel,
+        on_start=on_process_start,
+        on_finish=on_process_finish,
+    )
     if code != 0 or not output.is_file() or output.stat().st_size == 0:
         if output.is_file():
             output.unlink()
@@ -508,6 +529,10 @@ def _run_orca(
     output: Path,
     on_progress: Any,
     machine: dict[str, object] | None,
+    *,
+    should_cancel: Any = None,
+    on_process_start: Any = None,
+    on_process_finish: Any = None,
 ) -> tuple[int | None, float | None]:
     binary, library_path = locate_orca()
     if binary is None:
@@ -582,7 +607,14 @@ def _run_orca(
         assemble_path,
     )
     output.parent.mkdir(parents=True, exist_ok=True)
-    code, tail = run_slice(command, library_path, on_progress)
+    code, tail = run_slice(
+        command,
+        library_path,
+        on_progress,
+        should_cancel=should_cancel,
+        on_start=on_process_start,
+        on_finish=on_process_finish,
+    )
     if code != 0 or not archive.is_file() or archive.stat().st_size == 0:
         raise EngineError(tail or f"OrcaSlicer exited with status {code}")
     extract_plate_gcode(archive, output)
