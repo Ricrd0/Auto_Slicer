@@ -10,7 +10,9 @@ from auto_slicer.cura_config import PrinterProfile, active_config_dir
 from auto_slicer.engine import EngineError, build_slice_command, locate_cura, run_slice
 from auto_slicer.gcode import parse_gcode_header
 from auto_slicer.machine_sync import (
+    cura_extruder_temperature_overrides,
     cura_machine_overrides,
+    idex_offset_active,
     orca_filament_overrides,
     orca_process_extras,
     patch_orca_machine,
@@ -31,7 +33,15 @@ from auto_slicer.orca_config import (
     write_process_profile,
 )
 from auto_slicer.paths import DataPaths, safe_relative, safe_segment
-from auto_slicer.placement import Footprint, Layout, footprint_of, place_group, place_single
+from auto_slicer.placement import (
+    Footprint,
+    Layout,
+    PlacementZone,
+    footprint_of,
+    idex_zone,
+    place_group,
+    place_single,
+)
 from auto_slicer.settings_schema import SliceSettings, pack_gap
 
 
@@ -112,6 +122,7 @@ def layout_for_model(
     printer: PrinterProfile,
     settings: SliceSettings,
     pose: dict[str, Any] | None,
+    machine: dict[str, object] | None = None,
 ) -> Layout:
     part = replace(
         _footprint(input_dir, relative, effective_rotation(settings, pose), pose_scale(pose)),
@@ -123,6 +134,7 @@ def layout_for_model(
         float(printer.machine_depth or 0),
         float(printer.machine_height or 0),
         saved_position(pose),
+        _placement_zone(printer, machine),
     )
 
 
@@ -133,6 +145,7 @@ def layout_for_group(
     settings: SliceSettings,
     poses: dict[str, dict[str, Any]],
     manual_layout: dict[str, Any] | None,
+    machine: dict[str, object] | None = None,
 ) -> Layout:
     parts = []
     for relative in files:
@@ -163,6 +176,19 @@ def layout_for_group(
         float(printer.machine_height or 0),
         gap,
         manual,
+        _placement_zone(printer, machine),
+    )
+
+
+def _placement_zone(
+    printer: PrinterProfile, machine: dict[str, object] | None
+) -> PlacementZone | None:
+    if not idex_offset_active(machine) or machine is None:
+        return None
+    return idex_zone(
+        float(printer.machine_width or machine["bed_width"]),
+        float(printer.machine_depth or machine["bed_depth"]),
+        float(machine["idex_offset_x"]),
     )
 
 
@@ -206,39 +232,123 @@ def ensure_group_layout(
     where ``dirty`` means the caller should persist the group.
     """
     files = list(group["files"])
+    use_idex = idex_offset_active(machine)
+    offset_key = _offset_key(machine) if use_idex and machine is not None else None
+    if use_idex and offset_key is not None:
+        reused = _layout_from_offset_archive(input_dir, group, files, offset_key)
+        if reused is not None:
+            group["manual_layout"] = reused
+            layout = layout_for_group(
+                input_dir, files, printer, settings, poses, reused, machine
+            )
+            if layout.error is None:
+                return layout, True
     manual = group.get("manual_layout")
-    if isinstance(manual, dict) and manual:
+    if isinstance(manual, dict) and manual and not use_idex:
         refreshed = _refresh_layout_from_arranged_3mf(input_dir, group, files)
         if refreshed is not None:
             group["manual_layout"] = refreshed
             return (
-                layout_for_group(input_dir, files, printer, settings, poses, refreshed),
+                layout_for_group(
+                    input_dir, files, printer, settings, poses, refreshed, machine
+                ),
                 True,
             )
         return (
-            layout_for_group(input_dir, files, printer, settings, poses, manual),
+            layout_for_group(input_dir, files, printer, settings, poses, manual, machine),
             False,
         )
     if settings.slicer_engine == "orca":
-        positions, archive = arrange_group(
-            input_dir,
-            files,
-            printer,
-            settings,
-            poses,
-            str(group.get("name") or "group"),
-            machine,
-        )
+        short_id = str((machine or {}).get("printer_short_id") or "").strip()
+        group_name = str(group.get("name") or "group")
+        arrange_name = f"{group_name}_{short_id}" if use_idex and short_id else group_name
+        status: str | None = None
+        try:
+            positions, archive = arrange_group(
+                input_dir,
+                files,
+                printer,
+                settings,
+                poses,
+                arrange_name,
+                machine,
+                use_idex_zone=use_idex,
+            )
+            layout = layout_for_group(
+                input_dir, files, printer, settings, poses, positions, machine
+            )
+            if layout.error is not None and use_idex:
+                raise ValueError(layout.error or "IDEX arrange did not fit")
+        except (EngineError, ValueError):
+            if not use_idex:
+                raise
+            positions, archive = arrange_group(
+                input_dir,
+                files,
+                printer,
+                settings,
+                poses,
+                group_name,
+                machine,
+                use_idex_zone=False,
+            )
+            layout = layout_for_group(
+                input_dir, files, printer, settings, poses, positions, None
+            )
+            status = "IDEX offset zone too small; recentred on full bed"
+            use_idex = False
+            offset_key = None
+        if status is not None:
+            layout = Layout(
+                layout.bed_width,
+                layout.bed_depth,
+                layout.bed_height,
+                layout.items,
+                layout.error,
+                status,
+            )
         group["manual_layout"] = positions
         try:
-            group["arranged_3mf"] = archive.relative_to(input_dir).as_posix()
+            relative = archive.relative_to(input_dir).as_posix()
         except ValueError:
-            group["arranged_3mf"] = archive.name
-        return (
-            layout_for_group(input_dir, files, printer, settings, poses, positions),
-            True,
-        )
-    return layout_for_group(input_dir, files, printer, settings, poses, None), False
+            relative = archive.name
+        if use_idex and offset_key is not None:
+            by_offset = dict(group.get("arranged_3mf_by_offset") or {})
+            by_offset[offset_key] = relative
+            group["arranged_3mf_by_offset"] = by_offset
+            group["arranged_3mf"] = relative
+        else:
+            group["arranged_3mf"] = relative
+        return layout, True
+    return layout_for_group(input_dir, files, printer, settings, poses, None, machine), False
+
+
+def _offset_key(machine: dict[str, object]) -> str:
+    value = float(machine["idex_offset_x"])
+    if value.is_integer():
+        return str(int(value))
+    return format(value, "g")
+
+
+def _layout_from_offset_archive(
+    input_dir: Path,
+    group: dict[str, Any],
+    files: list[str],
+    offset_key: str,
+) -> dict[str, dict[str, float]] | None:
+    by_offset = group.get("arranged_3mf_by_offset")
+    if not isinstance(by_offset, dict):
+        return None
+    arranged = by_offset.get(offset_key)
+    if not arranged:
+        return None
+    archive = input_dir / safe_relative(str(arranged))
+    if not archive.is_file():
+        return None
+    try:
+        return layout_from_arranged_3mf(archive.read_bytes(), files)
+    except EngineError:
+        return None
 
 
 def _manual_rotation_z(manual_layout: dict[str, Any] | None, relative: str) -> float:
@@ -293,7 +403,7 @@ def prepare_slice(
             item.min_y,
             printer.machine_width,
             printer.machine_depth,
-            orca_origin(settings),
+            orca_origin(settings, printer),
             z=item.z,
             scale=item.scale,
         )
@@ -303,21 +413,35 @@ def prepare_slice(
     return PreparedSlice(layout, meshes, temporary)
 
 
-def output_model_path(printer_dir: str, folder: str, relative: str, test: bool) -> Path:
+def output_model_path(
+    printer_dir: str,
+    folder: str,
+    relative: str,
+    test: bool,
+    mode_suffix: str | None = None,
+) -> Path:
     model = safe_relative(relative)
-    gcode_name = model.with_suffix(".gcode")
+    stem = model.stem + (f"_{mode_suffix}" if mode_suffix else "")
+    gcode_name = model.with_name(f"{safe_segment(stem)}.gcode")
     parts = [safe_segment(printer_dir), safe_segment(folder)]
     if test:
         parts.append("_test")
-    return Path(*parts, gcode_name)
+    return Path(*parts, *gcode_name.parts)
 
 
-def output_group_path(printer_dir: str, folder: str, group_name: str, test: bool) -> Path:
+def output_group_path(
+    printer_dir: str,
+    folder: str,
+    group_name: str,
+    test: bool,
+    mode_suffix: str | None = None,
+) -> Path:
     parts = [safe_segment(printer_dir), safe_segment(folder)]
     if test:
         parts.append("_test")
     parts.append("groups")
-    return Path(*parts, f"{safe_segment(group_name)}.gcode")
+    name = safe_segment(group_name) + (f"_{mode_suffix}" if mode_suffix else "")
+    return Path(*parts, f"{name}.gcode")
 
 
 def run_prepared_slice(
@@ -334,6 +458,7 @@ def run_prepared_slice(
     engine, resources, library_path = locate_cura(paths)
     if engine is None or resources is None:
         raise EngineError("CuraEngine was not found. Build the Docker image or set CURA_ENGINE and CURA_RESOURCES.")
+    overrides = cura_machine_overrides(machine) if machine else None
     command = build_slice_command(
         engine,
         printer,
@@ -342,8 +467,14 @@ def run_prepared_slice(
         output,
         active_config_dir(paths.cura_config_dir),
         resources,
-        cura_machine_overrides(machine) if machine else None,
+        overrides,
     )
+    if machine is not None and printer.extruder_count > 1:
+        # Per-tool temps are applied after each -eN block by rewriting via a
+        # second pass of overrides appended in build_slice_command; inject T1
+        # temps into machine_overrides already used for both tools, then patch
+        # the command's second extruder block temperatures below.
+        command = _apply_cura_t1_temps(command, machine)
     output.parent.mkdir(parents=True, exist_ok=True)
     code, tail = run_slice(command, library_path, on_progress)
     if code != 0 or not output.is_file() or output.stat().st_size == 0:
@@ -351,6 +482,23 @@ def run_prepared_slice(
             output.unlink()
         raise EngineError(tail or f"CuraEngine exited with status {code}")
     return _header_from_file(output)
+
+
+def _apply_cura_t1_temps(command: list[str], machine: dict[str, object]) -> list[str]:
+    """Replace T0 material temps in the -e1 block with T1 values."""
+    try:
+        e1 = command.index("-e1")
+    except ValueError:
+        return command
+    temps = dict(cura_extruder_temperature_overrides(machine, 1))
+    updated = list(command)
+    for index in range(e1, len(updated) - 1):
+        if updated[index] != "-s":
+            continue
+        key, _, value = updated[index + 1].partition("=")
+        if key in temps:
+            updated[index + 1] = f"{key}={temps[key]}"
+    return updated
 
 
 def _run_orca(
@@ -381,7 +529,7 @@ def _run_orca(
     write_process_profile(
         process_path,
         settings,
-        orca_process_extras(machine) if machine else None,
+        orca_process_extras(machine, settings) if machine else None,
         inherits=process_inherits_for_machine(source),
         compatible_printers=compatible,
     )
@@ -393,17 +541,32 @@ def _run_orca(
             machine_json = patch_orca_machine(machine_json, machine)
         patched.write_text(json.dumps(machine_json, indent=2), encoding="utf-8")
         printer = _printer_with_machine_path(printer, patched)
-    filament = generic_pla(config_dir)
+    filament: Path | list[Path] | None = generic_pla(config_dir)
     filament_path = root / "filament.json"
     if machine is not None:
         write_filament_profile(
             filament_path,
-            orca_filament_overrides(machine),
+            orca_filament_overrides(machine, tool=0),
             name=str(machine.get("filament_name") or "Generic PLA"),
             inherits=str(machine.get("filament_inherits") or "fdm_filament_pla"),
             compatible_printers=compatible,
         )
-        filament = filament_path
+        filaments: list[Path] = [filament_path]
+        if int(machine.get("extruder_count") or printer.extruder_count or 1) > 1:
+            filament_t1 = root / "filament_t1.json"
+            write_filament_profile(
+                filament_t1,
+                orca_filament_overrides(machine, tool=1),
+                name=str(machine.get("filament_name_t1") or machine.get("filament_name") or "Generic PLA"),
+                inherits=str(
+                    machine.get("filament_inherits_t1")
+                    or machine.get("filament_inherits")
+                    or "fdm_filament_pla"
+                ),
+                compatible_printers=compatible,
+            )
+            filaments.append(filament_t1)
+        filament = filaments
     elif filament is None:
         write_filament_profile(filament_path, compatible_printers=compatible)
         filament = filament_path

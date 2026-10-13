@@ -42,16 +42,19 @@ def test_orca_discovery_keeps_single_extruder_machines(tmp_path: Path) -> None:
     _machine(system, "Ender")
     _machine(system, "Base", instantiation="false")
     _machine(system, "Twin", nozzle_diameter=["0.4", "0.4"])
+    _machine(system, "Triple", nozzle_diameter=["0.4", "0.4", "0.4"])
     user = tmp_path / "user" / "default" / "machine"
     _machine(user, "Ender", printable_height="300")
-    printers = {printer.name: printer for printer in discover_orca_printers(tmp_path)}
-    assert set(printers) == {"Ender", "Twin"}
+    printers = {printer.name: printer for printer in discover_orca_printers(tmp_path, include_bundled=False)}
+    assert set(printers) == {"Ender", "Twin", "Triple"}
     assert printers["Ender"].slicable
     assert printers["Ender"].machine_width == 220
     assert printers["Ender"].machine_height == 300
     assert printers["Ender"].id == "orca:Ender"
     assert printers["Ender"].engine == "orca"
-    assert not printers["Twin"].slicable
+    assert printers["Twin"].slicable
+    assert printers["Twin"].extruder_count == 2
+    assert not printers["Triple"].slicable
 
 
 def test_filament_temperatures_follow_the_inherited_bed_type(tmp_path: Path) -> None:
@@ -282,6 +285,15 @@ def test_shared_settings_map_onto_orca_keys() -> None:
     assert off["seam_slope_conditional"] == "0"
     assert values["sparse_infill_pattern"] == "lightning"
     assert values["sparse_infill_density"] == "5%"
+    assert values["reduce_crossing_wall"] == "1"
+    assert values["wall_loops"] == "3"
+    assert values["make_overhang_printable"] == "0"
+    assert values["resolution"] == "0.012"
+    assert values["precise_outer_wall"] == "1"
+    assert values["precise_z_height"] == "1"
+    assert values["enable_arc_fitting"] == "0"
+    assert values["slice_closing_radius"] == "0.05"
+    assert values["elefant_foot_compensation"] == "0.15"
     assert values["brim_type"] == "outer_only"
     assert values["brim_width"] == "8"
     assert values["enable_support"] == "0"

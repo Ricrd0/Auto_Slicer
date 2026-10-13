@@ -14,13 +14,15 @@ from auto_slicer.orca_config import active_orca_dir, locate_orca, search_filamen
 from auto_slicer.gcode import gcode_info, layer_polylines
 from auto_slicer.machine_sync import (
     GCODE_FLAVORS,
-    Z_HOP_TYPES,
     apply_save_scope,
+    machine_for_engine,
     machine_from_cura,
     machine_from_orca,
     normalize_filament,
     normalize_owned,
+    owned_for_printer,
     owned_from_orca,
+    with_synced_bed,
 )
 from auto_slicer.jobs import JobRunner
 from auto_slicer.paths import DataPaths, safe_relative, safe_segment
@@ -36,6 +38,8 @@ from auto_slicer.settings_schema import (
     SLICER_ENGINES,
     SUPPORT_STRUCTURES,
     SUPPORT_TYPES,
+    Z_HOP_ON_SURFACES,
+    Z_HOP_TYPES,
     SliceSettings,
 )
 from auto_slicer.slicing import (
@@ -81,7 +85,8 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
             "config_dir": str(config_dir),
             "orca_config_dir": str(orca_dir) if orca_dir else None,
             "slicer_engine": store.load_settings().slicer_engine,
-            "printer_count": len(runner.printers()),
+            # Avoid printer discovery here — Orca catalog scans can take minutes.
+            "printer_count": len(store.load_owned()),
         }
 
     @app.get("/api/options")
@@ -99,6 +104,7 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
             "slicer_engines": SLICER_ENGINES,
             "gcode_flavors": GCODE_FLAVORS,
             "z_hop_types": Z_HOP_TYPES,
+            "z_hop_on_surfaces": Z_HOP_ON_SURFACES,
         }
 
     @app.get("/api/settings")
@@ -114,19 +120,29 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
         store.save_settings(settings)
         return settings.to_dict()
 
+    @app.on_event("startup")
+    def _warm_printers() -> None:
+        runner.warm_printer_cache()
+
     @app.get("/api/printers")
-    def get_printers(catalog: bool = False) -> list[dict[str, object]]:
+    def get_printers(catalog: bool = False, refresh: bool = False) -> list[dict[str, object]]:
         enabled = store.load_enabled()
         return [
             printer.to_public_dict(enabled.get(printer.id, True))
-            for printer in runner.printers(catalog=catalog)
+            for printer in runner.printers(catalog=catalog, refresh=refresh)
         ]
 
     @app.get("/api/owned")
-    def get_owned() -> dict[str, object]:
-        owned = runner.ensure_owned()
-        orca = runner._discovered("orca")
-        cura = runner._discovered("cura")
+    def get_owned(refresh: bool = False) -> dict[str, object]:
+        if refresh:
+            cura = runner._discovered("cura")
+            orca = runner._discovered("orca")
+            owned = runner.ensure_owned(cura_printers=cura, orca_printers=orca)
+        else:
+            owned = runner.owned_snapshot()
+            cura = runner.cached_discovered("cura") or []
+            orca = runner.cached_discovered("orca") or []
+            runner.warm_printer_cache()
         return {
             "printers": _with_profile_names(owned, cura, orca),
             "orca_profiles": [{"id": printer.id, "name": printer.name} for printer in orca],
@@ -138,12 +154,26 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
             incoming = normalize_owned(payload)
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        owned = runner.ensure_owned()
+        # Use the saved list only — ensure_owned() can block on Orca discovery and
+        # race with the background catalog warm.
+        owned = runner.owned_snapshot()
         existing = next((item for item in owned if item["id"] == incoming["id"]), None)
+        if existing is None:
+            existing = next(
+                (
+                    item
+                    for item in owned
+                    if (incoming.get("cura_id") and item.get("cura_id") == incoming.get("cura_id"))
+                    or (incoming.get("orca_id") and item.get("orca_id") == incoming.get("orca_id"))
+                ),
+                None,
+            )
         try:
             record = apply_save_scope(existing, incoming, str(payload.get("scope") or "both"))
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if existing is not None and existing["id"] != record["id"]:
+            record["id"] = existing["id"]
         replaced = False
         updated: list[dict[str, object]] = []
         for item in owned:
@@ -337,11 +367,15 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
     @app.get("/api/models")
     def get_models() -> list[dict[str, object]]:
         models = list_models(model_root(store))
-        arranged = {
-            str(group["arranged_3mf"])
-            for group in store.load_groups()
-            if group.get("arranged_3mf")
-        }
+        arranged: set[str] = set()
+        for group in store.load_groups():
+            if group.get("arranged_3mf"):
+                arranged.add(str(group["arranged_3mf"]))
+            by_offset = group.get("arranged_3mf_by_offset")
+            if isinstance(by_offset, dict):
+                for value in by_offset.values():
+                    if value:
+                        arranged.add(str(value))
         if arranged:
             models = [model for model in models if str(model["path"]) not in arranged]
         included = store.load_locations().get("included")
@@ -475,6 +509,7 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="group was not found")
         group["manual_layout"] = None
         group["arranged_3mf"] = None
+        group["arranged_3mf_by_offset"] = None
         store.save_groups(groups)
         return {"groups": groups}
 
@@ -484,6 +519,11 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
         settings = store.load_settings()
         poses = store.load_poses()
         kind = str(payload.get("kind", "model"))
+        owned = runner.ensure_owned()
+        record = owned_for_printer(printer, owned)
+        machine = machine_for_engine(record, printer.engine) if record else None
+        if machine is not None:
+            printer = with_synced_bed(printer, machine)
         try:
             if kind == "model":
                 layout = layout_for_model(
@@ -492,6 +532,7 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
                     printer,
                     settings,
                     poses.get(str(payload.get("model", ""))),
+                    machine,
                 )
             elif kind == "group":
                 groups = store.load_groups()
@@ -507,12 +548,14 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
                     printer,
                     settings,
                     poses,
+                    machine,
                 )
                 if dirty:
                     store.save_groups(groups)
                 result = _layout_dict(layout)
                 result["manual_layout"] = group.get("manual_layout")
                 result["arranged_3mf"] = group.get("arranged_3mf")
+                result["arranged_3mf_by_offset"] = group.get("arranged_3mf_by_offset")
                 return result
             else:
                 raise HTTPException(status_code=400, detail="kind must be model or group")
@@ -639,6 +682,7 @@ def _layout_dict(layout: Layout) -> dict[str, object]:
         "bed_depth": layout.bed_depth,
         "bed_height": layout.bed_height,
         "error": layout.error,
+        "status": layout.status,
         "items": [
             {
                 "file": item.file,

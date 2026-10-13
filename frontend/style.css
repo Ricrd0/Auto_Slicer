@@ -147,6 +147,30 @@ a { color: var(--link); }
   border-bottom: 1px solid var(--line);
   border-radius: 0;
   background: transparent;
+  color: var(--ink);
+}
+
+#filament-panel {
+  color: var(--ink);
+}
+#filament-panel summary {
+  cursor: pointer;
+  color: var(--ink);
+  font-weight: 600;
+  font-size: 1rem;
+  list-style-position: outside;
+}
+#filament-panel .filament-help,
+#filament-notice,
+#filament-form .muted,
+#filament-panel .muted {
+  color: #d8cbb8;
+}
+#filament-list > button {
+  color: var(--ink);
+}
+#filament-list > button.primary {
+  color: var(--accent-ink);
 }
 
 .model-matrix-wrap { max-height: 560px; overflow: auto; }

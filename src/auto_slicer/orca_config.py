@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 import zipfile
 from pathlib import Path
 
@@ -50,16 +52,44 @@ def active_orca_dir() -> Path | None:
     for candidate in candidates:
         if _has_machines(candidate):
             return candidate
+    bundled = bundled_orca_profiles_dir()
+    if bundled is not None and _has_machines(bundled):
+        return bundled
     return None
 
 
-def discover_orca_printers(config_dir: Path | None) -> list[PrinterProfile]:
-    if config_dir is None or not config_dir.is_dir():
-        return []
+def bundled_orca_profiles_dir() -> Path | None:
+    """Repo/image-bundled Orca vendor pack (Anycubic Kossel, etc.)."""
+    candidates = [
+        Path(__file__).resolve().parents[2] / "resources" / "orca_profiles",
+        Path("/opt/auto-slicer/resources/orca_profiles"),
+    ]
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def discover_orca_printers(
+    config_dir: Path | None, *, include_bundled: bool = True
+) -> list[PrinterProfile]:
     found: dict[str, PrinterProfile] = {}
-    for kind in ("system", "user"):
-        for path in _machine_jsons(config_dir / kind):
-            profile = _load_machine(path, config_dir)
+    roots: list[Path] = []
+    if config_dir is not None and config_dir.is_dir():
+        roots.append(config_dir)
+    if include_bundled:
+        bundled = bundled_orca_profiles_dir()
+        if bundled is not None and bundled not in roots:
+            roots.append(bundled)
+    for root in roots:
+        for kind in ("system", "user"):
+            for path in _machine_jsons(root / kind):
+                profile = _load_machine(path, root)
+                if profile is not None:
+                    found[profile.name] = profile
+        # Vendor packs live directly under the root (Anycubic/, Custom/, …).
+        for path in _machine_jsons(root):
+            profile = _load_machine(path, root)
             if profile is not None:
                 found[profile.name] = profile
     return [found[name] for name in sorted(found)]
@@ -277,13 +307,14 @@ def build_orca_command(
     output_3mf: Path,
     config_dir: Path,
     process_path: Path,
-    filament_path: Path,
+    filament_path: Path | list[Path],
     assemble_path: Path,
 ) -> list[str]:
     if printer.definition_path is None:
         raise EngineError(printer.error or "Orca machine profile is missing")
     if not meshes:
         raise EngineError("there is no mesh to slice")
+    filaments = filament_path if isinstance(filament_path, list) else [filament_path]
     return [
         str(binary),
         "--datadir",
@@ -291,7 +322,7 @@ def build_orca_command(
         "--load-settings",
         f"{process_path};{printer.definition_path}",
         "--load-filaments",
-        str(filament_path),
+        ";".join(str(path) for path in filaments),
         "--load-assemble-list",
         str(assemble_path),
         "--slice",
@@ -309,7 +340,7 @@ def build_orca_arrange_command(
     output_3mf: Path,
     config_dir: Path,
     process_path: Path,
-    filament_path: Path,
+    filament_path: Path | list[Path],
     settings: SliceSettings,
 ) -> list[str]:
     """Arrange separate STLs onto one plate and export a full project 3MF.
@@ -321,6 +352,7 @@ def build_orca_arrange_command(
         raise EngineError(printer.error or "Orca machine profile is missing")
     if not meshes:
         raise EngineError("there is no mesh to arrange")
+    filaments = filament_path if isinstance(filament_path, list) else [filament_path]
     command = [
         str(binary),
         "--datadir",
@@ -328,7 +360,7 @@ def build_orca_arrange_command(
         "--load-settings",
         f"{process_path};{printer.definition_path}",
         "--load-filaments",
-        str(filament_path),
+        ";".join(str(path) for path in filaments),
         "--arrange=1",
         f"--allow-rotations={'1' if settings.orca_arrange_rotate else '0'}",
         f"--allow-multicolor-oneplate={'1' if settings.orca_arrange_multicolor else '0'}",
@@ -349,8 +381,61 @@ def extract_plate_gcode(archive_path: Path, destination: Path) -> None:
         destination.write_bytes(archive.read(sorted(chosen)[0]))
 
 
-def orca_origin(settings: SliceSettings) -> str:
-    return "front_left" if settings.slicer_engine == "orca" else "bed_center"
+def orca_origin(settings: SliceSettings, printer: PrinterProfile | None = None) -> str:
+    """Mesh origin for the active engine.
+
+    Orca usually uses front-left printable areas. Delta / center-zero beds
+    (negative printable_area coordinates) need bed-centered mesh coords.
+    """
+    if settings.slicer_engine != "orca":
+        return "bed_center"
+    if printer is not None and printer.machine_center_is_zero:
+        return "bed_center"
+    return "front_left"
+
+
+def area_is_center_zero(area: object) -> bool:
+    if not isinstance(area, list):
+        return False
+    for point in area:
+        if not isinstance(point, str) or "x" not in point.lower():
+            continue
+        left, right = point.lower().split("x", 1)
+        try:
+            if float(left) < -1e-6 or float(right) < -1e-6:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def circular_printable_area(diameter: float, *, segments: int = 72) -> list[str]:
+    """Polygon approximating a circular bed centered at the origin."""
+    radius = max(float(diameter), 0.0) / 2.0
+    points: list[str] = []
+    for index in range(max(8, int(segments))):
+        angle = 2.0 * math.pi * index / segments
+        x = radius * math.cos(angle)
+        y = radius * math.sin(angle)
+        points.append(f"{x:g}x{y:g}")
+    return points
+
+
+def resolve_orca_machine(
+    data: dict[str, object], config_dir: Path | None
+) -> dict[str, object]:
+    """Merge ``inherits`` parents so bed size and flavor are visible on nozzle presets."""
+    if config_dir is None:
+        return dict(data)
+    indexed = _machine_profile_index(config_dir)
+    return _resolve_machine_data(data, indexed, set())
+
+
+def orca_display_name(name: str) -> str:
+    """Stable UI/output name for Orca catalog profiles (e.g. J1 nozzle → J1S)."""
+    if re.match(r"(?i)^snapmaker\s+j1(\b|$)", name.strip()):
+        return "Snapmaker J1S"
+    return name
 
 
 def _load_machine(path: Path, config_dir: Path) -> PrinterProfile | None:
@@ -362,23 +447,27 @@ def _load_machine(path: Path, config_dir: Path) -> PrinterProfile | None:
         return None
     if not _is_true(data.get("instantiation")):
         return None
-    name = str(data.get("name") or path.stem)
-    nozzles = data.get("nozzle_diameter")
+    catalog_name = str(data.get("name") or path.stem)
+    resolved = resolve_orca_machine(data, config_dir)
+    nozzles = resolved.get("nozzle_diameter")
+    if not isinstance(nozzles, list) or not nozzles:
+        nozzles = data.get("nozzle_diameter")
     extruder_count = len(nozzles) if isinstance(nozzles, list) and nozzles else 0
-    bed = _bed_size(data.get("printable_area"))
-    height = _float_or_none(data.get("printable_height"))
+    bed = _bed_size(resolved.get("printable_area"))
+    height = _float_or_none(resolved.get("printable_height"))
     error = None
     if extruder_count == 0:
         error = "nozzle_diameter is missing"
-    elif extruder_count > 1:
-        error = "only single-extruder printers can be sliced"
+    elif extruder_count > 2:
+        error = f"at most two extruders are supported; this machine has {extruder_count}"
     if bed is None:
         error = error or "printable_area is missing"
     width, depth = bed if bed is not None else (None, None)
+    display = orca_display_name(catalog_name)
     return PrinterProfile(
-        id=f"orca:{name}",
-        name=name,
-        definition_id=name,
+        id=f"orca:{catalog_name}",
+        name=display,
+        definition_id=catalog_name,
         definition_path=str(path),
         extruder_definition_id=None,
         extruder_definition_path=None,
@@ -387,7 +476,7 @@ def _load_machine(path: Path, config_dir: Path) -> PrinterProfile | None:
         machine_width=width,
         machine_depth=depth,
         machine_height=height,
-        machine_center_is_zero=False,
+        machine_center_is_zero=area_is_center_zero(resolved.get("printable_area")),
         extruder_count=extruder_count or 1,
         setting_version=None,
         resource_setting_version=None,
@@ -470,6 +559,48 @@ def _resolve_filament(name: str, indexed: dict[str, dict[str, object]], seen: se
     merged = _resolve_filament(parent, indexed, seen) if parent else {}
     for key, value in data.items():
         if key in {"type", "name", "inherits", "from", "instantiation", "setting_id", "filament_id"}:
+            continue
+        merged[key] = value
+    return merged
+
+
+def _machine_profile_index(config_dir: Path) -> dict[str, dict[str, object]]:
+    indexed: dict[str, dict[str, object]] = {}
+    roots = [config_dir / "system", config_dir / "user", config_dir]
+    for root in roots:
+        for path in _machine_jsons(root):
+            data = _read_json(path)
+            if data is None or data.get("type") not in {None, "machine"}:
+                continue
+            name = str(data.get("name") or path.stem)
+            indexed[name] = data
+            # Inherit targets are often bare ids without the display name.
+            stem = path.stem
+            if stem not in indexed:
+                indexed[stem] = data
+    return indexed
+
+
+def _resolve_machine_data(
+    data: dict[str, object],
+    indexed: dict[str, dict[str, object]],
+    seen: set[str],
+) -> dict[str, object]:
+    name = str(data.get("name") or "")
+    if name:
+        if name in seen:
+            return {}
+        seen.add(name)
+    parent = str(data.get("inherits") or "").strip()
+    merged: dict[str, object] = {}
+    if parent:
+        parent_data = indexed.get(parent)
+        if parent_data is not None:
+            merged = _resolve_machine_data(parent_data, indexed, seen)
+    for key, value in data.items():
+        if key in {"type", "inherits", "from", "instantiation", "setting_id"}:
+            continue
+        if value in (None, "", [], {}):
             continue
         merged[key] = value
     return merged

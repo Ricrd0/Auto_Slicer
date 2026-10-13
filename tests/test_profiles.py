@@ -20,7 +20,9 @@ def test_stack_order_and_shared_settings_win(tmp_path: Path) -> None:
     assert shop.machine_width == 220
     assert [key for key, _value in shop.global_settings] == ["layer_height", "ironing_enabled", "infill_sparse_density"]
     assert shop.global_settings[-1] == ("infill_sparse_density", "20")
-    assert printers["dual"].error is not None
+    assert printers["dual"].error is None
+    assert printers["dual"].slicable
+    assert printers["dual"].extruder_count == 2
     assert printers["missing"].error is not None
 
     command = build_slice_command(
@@ -32,6 +34,17 @@ def test_stack_order_and_shared_settings_win(tmp_path: Path) -> None:
         config,
         resources,
     )
+    dual_command = build_slice_command(
+        Path("/opt/cura/CuraEngine"),
+        printers["dual"],
+        SliceSettings(output_folder_name="building_1"),
+        [Path("/tmp/model.stl")],
+        Path("/tmp/out.gcode"),
+        config,
+        resources,
+    )
+    assert "-e0" in dual_command
+    assert "-e1" in dual_command
     settings = _settings(command)
     layer_heights = [value for key, value in settings if key == "layer_height"]
     assert layer_heights[0] == "0.28"

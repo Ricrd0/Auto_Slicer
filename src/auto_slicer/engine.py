@@ -58,12 +58,18 @@ def build_slice_command(
     command.extend(_setting_args(printer.global_settings))
     command.extend(_setting_args(overrides))
     command.extend(_setting_args(machine_overrides or []))
-    command.extend(["-e0", "-j", fdmextruder])
-    if printer.extruder_definition_path:
-        command.extend(["-j", printer.extruder_definition_path])
-    command.extend(_setting_args(printer.extruder_settings))
-    command.extend(_setting_args(overrides))
-    command.extend(_setting_args(machine_overrides or []))
+    tools = [
+        (printer.extruder_definition_path, printer.extruder_settings),
+    ]
+    if printer.extruder_count > 1:
+        tools.append((printer.extruder_definition_path_t1, printer.extruder_settings_t1))
+    for index, (definition_path, extruder_settings) in enumerate(tools):
+        command.extend([f"-e{index}", "-j", fdmextruder])
+        if definition_path:
+            command.extend(["-j", definition_path])
+        command.extend(_setting_args(extruder_settings))
+        command.extend(_setting_args(overrides))
+        command.extend(_setting_args(machine_overrides or []))
     for mesh in meshes:
         command.extend(
             [

@@ -18,6 +18,24 @@ def test_defaults_match_the_shop_profile() -> None:
     assert settings.infill_pattern == "lightning"
     assert settings.infill_sparse_density == 5
     assert settings.retraction_combing == "noskin"
+    assert settings.travel_avoid_other_parts is True
+    assert settings.wall_thickness == 1.2
+    assert settings.make_overhang_printable is False
+    assert settings.purge_line is True
+    assert settings.meshfix_maximum_resolution == 0.05
+    assert settings.meshfix_maximum_deviation == 0.025
+    assert settings.meshfix_maximum_travel_resolution == 0.2
+    assert settings.meshfix_union_all is True
+    assert settings.orca_resolution == 0.012
+    assert settings.precise_outer_wall is True
+    assert settings.precise_z_height is True
+    assert settings.enable_arc_fitting is False
+    assert settings.slice_closing_radius == 0.05
+    assert settings.elephant_foot_compensation == 0.15
+    assert settings.z_hop_enabled is True
+    assert settings.z_hop == 0.2
+    assert settings.z_hop_type == "Normal Lift"
+    assert settings.z_hop_on_surfaces == "Top Only"
     assert settings.adhesion_type == "brim"
     assert settings.support_enable is False
     assert settings.orca_arrange_spacing == 0
@@ -36,7 +54,20 @@ def test_shared_overrides_put_combing_seam_and_infill_last_among_themselves() ->
     assert pairs["infill_pattern"] == "lightning"
     assert pairs["infill_sparse_density"] == "5"
     assert pairs["retraction_combing"] == "noskin"
+    assert pairs["travel_avoid_other_parts"] == "true"
+    assert pairs["wall_thickness"] == "1.2"
+    assert pairs["conical_overhang_enabled"] == "false"
+    assert pairs["meshfix_maximum_resolution"] == "0.05"
+    assert pairs["meshfix_maximum_deviation"] == "0.025"
+    assert pairs["meshfix_maximum_travel_resolution"] == "0.2"
+    assert pairs["meshfix_union_all"] == "true"
+    assert pairs["xy_offset_layer_0"] == "-0.15"
+    assert pairs["retraction_hop"] == "0.2"
+    assert pairs["retraction_hop_enabled"] == "true"
     assert pairs["adhesion_type"] == "brim"
+    off = dict(cura_setting_overrides(SliceSettings(z_hop_enabled=False, z_hop=0.4)))
+    assert off["retraction_hop_enabled"] == "false"
+    assert off["retraction_hop"] == "0"
     assert pairs["brim_width"] == "8"
     assert pairs["support_enable"] == "false"
     assert pairs["center_object"] == "false"

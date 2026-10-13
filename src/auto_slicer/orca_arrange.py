@@ -39,6 +39,8 @@ def arrange_group(
     poses: dict[str, dict[str, Any]],
     group_name: str,
     machine: dict[str, object] | None = None,
+    *,
+    use_idex_zone: bool = False,
 ) -> tuple[dict[str, dict[str, float]], Path]:
     """Auto-arrange group parts with Orca and save a reusable project 3MF.
 
@@ -79,27 +81,46 @@ def arrange_group(
         )
         machine_json = dict(source)
         if machine is not None:
-            machine_json = patch_orca_machine(machine_json, machine)
+            machine_json = patch_orca_machine(
+                machine_json, machine, use_idex_zone=use_idex_zone
+            )
         machine_json["printer_structure"] = "i3" if settings.orca_arrange_align_y else "undefine"
         patched = root / "machine.json"
         patched.write_text(json.dumps(machine_json, indent=2), encoding="utf-8")
         arranged_printer = replace(printer, definition_path=str(patched))
+        filaments: Path | list[Path]
         if machine is not None:
             write_filament_profile(
                 filament_path,
-                orca_filament_overrides(machine),
+                orca_filament_overrides(machine, tool=0),
                 name=str(machine.get("filament_name") or "Generic PLA"),
                 inherits=str(machine.get("filament_inherits") or "fdm_filament_pla"),
                 compatible_printers=compatible,
             )
-            filament: Path = filament_path
+            filaments = [filament_path]
+            if int(machine.get("extruder_count") or printer.extruder_count or 1) > 1:
+                filament_t1 = root / "filament_t1.json"
+                write_filament_profile(
+                    filament_t1,
+                    orca_filament_overrides(machine, tool=1),
+                    name=str(
+                        machine.get("filament_name_t1") or machine.get("filament_name") or "Generic PLA"
+                    ),
+                    inherits=str(
+                        machine.get("filament_inherits_t1")
+                        or machine.get("filament_inherits")
+                        or "fdm_filament_pla"
+                    ),
+                    compatible_printers=compatible,
+                )
+                filaments.append(filament_t1)
         else:
             found = generic_pla(config_dir)
             if found is None:
                 write_filament_profile(filament_path, compatible_printers=compatible)
-                filament = filament_path
+                filaments = filament_path
             else:
-                filament = found
+                filaments = found
         export_path = root / "arranged.3mf"
         command = build_orca_arrange_command(
             binary,
@@ -108,7 +129,7 @@ def arrange_group(
             export_path,
             config_dir,
             process_path,
-            filament,
+            filaments,
             settings,
         )
         code, tail = run_slice(command, library_path)

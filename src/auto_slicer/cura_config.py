@@ -61,6 +61,9 @@ class PrinterProfile:
     source_files: list[str] = field(default_factory=list)
     global_cfg: str | None = None
     config_root: str = ""
+    extruder_definition_id_t1: str | None = None
+    extruder_definition_path_t1: str | None = None
+    extruder_settings_t1: list[tuple[str, str]] = field(default_factory=list)
 
     @property
     def version_mismatch(self) -> bool:
@@ -72,7 +75,12 @@ class PrinterProfile:
 
     @property
     def slicable(self) -> bool:
-        return self.error is None and self.extruder_count <= 1 and self.machine_width is not None
+        # Owned stubs shown while the catalog loads have bed size but no definition.
+        if self.error is not None or self.extruder_count > 2 or self.machine_width is None:
+            return False
+        if self.definition_path is None and not self.definition_id:
+            return False
+        return True
 
     def to_public_dict(self, enabled: bool) -> dict[str, object]:
         warnings = list(self.warnings)
@@ -208,11 +216,11 @@ def _load_printer(
     trains = _extruder_trains(metadata)
     if not trains:
         trains = _extruders_for_machine(index, machine_id, name)
-    extruder_settings: list[tuple[str, str]] = []
-    extruder_definition_id: str | None = None
-    extruder_definition_path: Path | None = None
-    if trains:
-        extruder_id = trains[0]
+    loaded_trains: list[tuple[str | None, Path | None, list[tuple[str, str]]]] = []
+    for extruder_id in trains[:2]:
+        extruder_settings: list[tuple[str, str]] = []
+        extruder_definition_id: str | None = None
+        extruder_definition_path: Path | None = None
         extruder_path = index.get(extruder_id)
         if extruder_path is not None and extruder_path.name.endswith(".extruder.cfg"):
             source_files.extend(_user_source(config_dir, extruder_path))
@@ -235,11 +243,16 @@ def _load_printer(
                 extruder_settings.extend(values)
         else:
             warnings.append(f"missing extruder stack {extruder_id}")
-    if extruder_definition_id is None:
+        loaded_trains.append((extruder_definition_id, extruder_definition_path, extruder_settings))
+    if not loaded_trains:
+        meta_train = _definition_extruder_id(definition_path)
+        loaded_trains.append(
+            (meta_train, index.get(meta_train) if meta_train else None, [])
+        )
+    elif loaded_trains[0][0] is None:
         meta_train = _definition_extruder_id(definition_path)
         if meta_train:
-            extruder_definition_id = meta_train
-            extruder_definition_path = index.get(meta_train)
+            loaded_trains[0] = (meta_train, index.get(meta_train), loaded_trains[0][2])
 
     extruder_count = len(trains) if trains else int(_as_float(geometry.get("machine_extruder_count"), 1))
     width = _as_float(geometry.get("machine_width"), None)
@@ -249,8 +262,8 @@ def _load_printer(
     error = None
     if definition_path is None:
         error = f"printer definition {definition_id or '(missing)'} was not found"
-    elif extruder_count > 1:
-        error = f"single-extruder only; this machine has {extruder_count} extruders"
+    elif extruder_count > 2:
+        error = f"at most two extruders are supported; this machine has {extruder_count}"
     elif width is None or depth is None or height is None:
         error = "machine bed size is not a number in this profile"
     if definition_path is not None:
@@ -260,15 +273,17 @@ def _load_printer(
     for item in source_files:
         if item not in unique_sources:
             unique_sources.append(item)
+    t0_id, t0_path, t0_settings = loaded_trains[0]
+    t1_id, t1_path, t1_settings = loaded_trains[1] if len(loaded_trains) > 1 else (None, None, [])
     return PrinterProfile(
         id=machine_id,
         name=name,
         definition_id=definition_id,
         definition_path=str(definition_path) if definition_path else None,
-        extruder_definition_id=extruder_definition_id,
-        extruder_definition_path=str(extruder_definition_path) if extruder_definition_path else None,
+        extruder_definition_id=t0_id,
+        extruder_definition_path=str(t0_path) if t0_path else None,
         global_settings=global_settings,
-        extruder_settings=extruder_settings,
+        extruder_settings=t0_settings,
         machine_width=width,
         machine_depth=depth,
         machine_height=height,
@@ -281,6 +296,9 @@ def _load_printer(
         source_files=unique_sources,
         global_cfg=_relative(config_dir, global_cfg),
         config_root=str(config_dir.resolve()),
+        extruder_definition_id_t1=t1_id,
+        extruder_definition_path_t1=str(t1_path) if t1_path else None,
+        extruder_settings_t1=t1_settings,
     )
 
 

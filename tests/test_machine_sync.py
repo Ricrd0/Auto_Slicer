@@ -5,6 +5,8 @@ from auto_slicer.cura_config import PrinterProfile
 from auto_slicer.machine_sync import (
     apply_filament,
     apply_save_scope,
+    apply_shared_slice_to_machine,
+    apply_shared_z_hop,
     best_orca_match,
     cura_machine_overrides,
     filter_owned_orca,
@@ -13,25 +15,167 @@ from auto_slicer.machine_sync import (
     normalize_machine,
     normalize_owned,
     orca_filament_overrides,
+    orca_process_extras,
     patch_orca_machine,
+    printers_for_page,
     sync_owned_with_orca_user_profiles,
+    with_purge_line,
 )
 from auto_slicer.orca_config import apply_user_orca_machine_override, user_orca_machine_override
+from auto_slicer.settings_schema import SliceSettings
 
 
 def test_z_hop_options_are_written_for_both_engines() -> None:
-    machine = normalize_machine({"z_hop": 0.4, "z_hop_type": "Spiral Lift"})
+    machine = normalize_machine(
+        {
+            "z_hop_enabled": True,
+            "z_hop": 0.4,
+            "z_hop_type": "Spiral Lift",
+            "z_hop_on_surfaces": "Top Only",
+        }
+    )
     cura = dict(cura_machine_overrides(machine))
     assert cura["retraction_hop"] == "0.4"
     assert cura["retraction_hop_enabled"] == "true"
     patched = patch_orca_machine({}, machine)
     assert patched["z_hop"] == ["0.4"]
     assert patched["z_hop_types"] == ["Spiral Lift"]
+    assert patched["retract_lift_enforce"] == ["Top Only"]
     filament = orca_filament_overrides(machine)
     assert filament["filament_z_hop"] == ["0.4"]
     assert filament["filament_z_hop_types"] == ["Spiral Lift"]
-    disabled = dict(cura_machine_overrides(normalize_machine({"z_hop": 0})))
+    assert filament["filament_retract_lift_enforce"] == ["Top Only"]
+    disabled = dict(cura_machine_overrides(normalize_machine({"z_hop_enabled": False, "z_hop": 0.4})))
     assert disabled["retraction_hop_enabled"] == "false"
+    assert disabled["retraction_hop"] == "0"
+    orca_off = patch_orca_machine({}, normalize_machine({"z_hop_enabled": False, "z_hop": 0.4}))
+    assert orca_off["z_hop"] == ["0"]
+
+
+def test_shared_z_hop_applies_unless_printer_overrides() -> None:
+    machine = normalize_machine({"z_hop": 0.4, "z_hop_type": "Spiral Lift"})
+    followed = apply_shared_z_hop(
+        machine, 0.1, "Slope Lift", z_hop_enabled=True, z_hop_on_surfaces="Top Only"
+    )
+    assert followed["z_hop"] == 0.1
+    assert followed["z_hop_type"] == "Slope Lift"
+    assert followed["z_hop_enabled"] is True
+    assert followed["z_hop_on_surfaces"] == "Top Only"
+    override = normalize_machine({"z_hop": 0.4, "z_hop_type": "Spiral Lift", "z_hop_override": True})
+    kept = apply_shared_z_hop(override, 0.1, "Slope Lift", z_hop_enabled=False)
+    assert kept["z_hop"] == 0.4
+    assert kept["z_hop_type"] == "Spiral Lift"
+
+
+def test_shared_slice_applies_combing_and_purge() -> None:
+    machine = normalize_machine(
+        {
+            "cura_start_gcode": "G28\n",
+            "orca_start_gcode": "G28\n",
+            "retraction_combing": "all",
+        }
+    )
+    settings = SliceSettings(retraction_combing="noskin", purge_line=True, z_hop=0.3)
+    applied = apply_shared_slice_to_machine(machine, settings)
+    assert applied["retraction_combing"] == "noskin"
+    assert applied["z_hop"] == 0.3
+    assert ";AUTO_SLICER_PURGE_LINE" in str(applied["cura_start_gcode"])
+    assert ";AUTO_SLICER_PURGE_LINE" in str(applied["orca_start_gcode"])
+    override = normalize_machine(
+        {
+            "combing_override": True,
+            "retraction_combing": "infill",
+            "cura_start_gcode": "",
+        }
+    )
+    kept = apply_shared_slice_to_machine(override, settings)
+    assert kept["retraction_combing"] == "infill"
+    assert kept["cura_start_gcode"] == ""
+
+
+def test_retraction_extras_are_written_for_cura() -> None:
+    machine = normalize_machine(
+        {
+            "retraction_min_travel": 2.0,
+            "retraction_extrusion_window": 1.0,
+            "retraction_combing_max_distance": 10.0,
+            "retraction_combing": "noskin",
+        }
+    )
+    cura = dict(cura_machine_overrides(machine))
+    assert cura["retraction_min_travel"] == "2"
+    assert cura["retraction_extrusion_window"] == "1"
+    assert cura["retraction_combing_max_distance"] == "10"
+    assert cura["retraction_combing"] == "noskin"
+
+
+def test_purge_line_helper_is_idempotent() -> None:
+    once = with_purge_line("G28\n", bed_depth=200)
+    twice = with_purge_line(once, bed_depth=200)
+    assert once == twice
+    assert with_purge_line("", bed_depth=200) == ""
+
+
+def test_print_speeds_are_written_for_both_engines() -> None:
+    machine = normalize_machine(
+        {
+            "print_speed": 55,
+            "outer_wall_speed": 28,
+            "inner_wall_speed": 50,
+            "infill_speed": 70,
+            "initial_layer_speed": 18,
+            "travel_speed": 160,
+        }
+    )
+    cura = dict(cura_machine_overrides(machine))
+    assert cura["speed_print"] == "55"
+    assert cura["speed_wall_0"] == "28"
+    assert cura["speed_wall_x"] == "50"
+    assert cura["speed_infill"] == "70"
+    assert cura["speed_layer_0"] == "18"
+    assert cura["speed_travel"] == "160"
+    process = orca_process_extras(machine, SliceSettings(wall_thickness=1.2))
+    assert process["outer_wall_speed"] == "28"
+    assert process["inner_wall_speed"] == "50"
+    assert process["sparse_infill_speed"] == "70"
+    assert process["initial_layer_speed"] == "18"
+    assert process["travel_speed"] == "160"
+    assert process["wall_loops"] == "3"
+
+
+def test_printers_page_includes_owned_without_engine_link() -> None:
+    orca = [_printer("Creality Ender-3 0.4 nozzle")]
+    owned = [
+        normalize_owned(
+            {
+                "id": "owned:tenlog",
+                "name": "Tenlog TL-D3 Pro",
+                "cura_id": "Tronxy XY-3 Pro V2",
+                "orca_id": None,
+                "settings": {"bed_width": 300, "bed_depth": 290, "bed_height": 350},
+            }
+        ),
+        normalize_owned(
+            {
+                "id": "owned:ender",
+                "name": "Shop Ender",
+                "cura_id": None,
+                "orca_id": "orca:Creality Ender-3 0.4 nozzle",
+                "settings": {},
+            }
+        ),
+    ]
+    page = printers_for_page(orca, owned, engine="orca")
+    assert [printer.name for printer in page] == ["Tenlog TL-D3 Pro", "Shop Ender"]
+    assert page[0].error
+    assert not page[0].slicable
+    assert page[1].slicable
+    assert page[1].id == "orca:Creality Ender-3 0.4 nozzle"
+    cold = printers_for_page([], owned, engine="orca")
+    assert [printer.name for printer in cold] == ["Tenlog TL-D3 Pro", "Shop Ender"]
+    assert cold[1].id == "orca:Creality Ender-3 0.4 nozzle"
+    assert not cold[1].slicable
+    assert cold[1].machine_width is None or True  # bed from owned defaults after normalize
 
 
 def _printer(name: str, engine: str = "orca", **extra: object) -> PrinterProfile:

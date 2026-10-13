@@ -1,0 +1,25 @@
+{
+  "name": "Anycubic",
+  "version": "01.00.00.01",
+  "force_update": "0",
+  "description": "Auto Slicer bundled Anycubic Kossel Linear Plus (Klipper)",
+  "machine_model_list": [
+    {
+      "name": "Anycubic Kossel Linear Plus",
+      "sub_path": "machine/Anycubic Kossel Linear Plus.json"
+    }
+  ],
+  "process_list": [
+    {
+      "name": "0.20mm Standard @Kossel",
+      "sub_path": "process/0.20mm Standard @Kossel.json"
+    }
+  ],
+  "filament_list": [],
+  "machine_list": [
+    {
+      "name": "Anycubic Kossel Linear Plus 0.4 nozzle",
+      "sub_path": "machine/Anycubic Kossel Linear Plus 0.4 nozzle.json"
+    }
+  ]
+}

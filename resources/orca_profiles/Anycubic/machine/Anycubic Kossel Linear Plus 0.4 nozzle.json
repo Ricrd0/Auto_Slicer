@@ -1,0 +1,230 @@
+{
+  "version": "2.4.2.0",
+  "type": "machine",
+  "from": "User",
+  "setting_id": "AKLP04AS",
+  "printer_model": "Anycubic Kossel Linear Plus",
+  "name": "Anycubic Kossel Linear Plus 0.4 nozzle",
+  "printer_settings_id": "Anycubic Kossel Linear Plus 0.4 nozzle",
+  "printer_variant": "0.4",
+  "instantiation": "true",
+  "inherits": "",
+  "default_print_profile": "fdm_process_klipper_common",
+  "default_filament_profile": [
+    "Generic PLA"
+  ],
+  "printer_structure": "delta",
+  "printer_technology": "FFF",
+  "gcode_flavor": "klipper",
+  "nozzle_diameter": [
+    "0.4"
+  ],
+  "nozzle_type": "brass",
+  "printer_notes": "Bundled Auto Slicer profile. Circular 230mm bed, center origin, Klipper. Tuned for direct-drive + input shaping; firmware owns PA/accel limits.",
+  "printable_area": [
+    "115x0",
+    "114.562x10.0229",
+    "113.253x19.9695",
+    "111.081x29.7642",
+    "108.065x39.3323",
+    "104.225x48.6011",
+    "99.5929x57.5",
+    "94.2025x65.9613",
+    "88.0951x73.9206",
+    "81.3173x81.3173",
+    "73.9206x88.0951",
+    "65.9613x94.2025",
+    "57.5x99.5929",
+    "48.6011x104.225",
+    "39.3323x108.065",
+    "29.7642x111.081",
+    "19.9695x113.253",
+    "10.0229x114.562",
+    "7.04172e-15x115",
+    "-10.0229x114.562",
+    "-19.9695x113.253",
+    "-29.7642x111.081",
+    "-39.3323x108.065",
+    "-48.6011x104.225",
+    "-57.5x99.5929",
+    "-65.9613x94.2025",
+    "-73.9206x88.0951",
+    "-81.3173x81.3173",
+    "-88.0951x73.9206",
+    "-94.2025x65.9613",
+    "-99.5929x57.5",
+    "-104.225x48.6011",
+    "-108.065x39.3323",
+    "-111.081x29.7642",
+    "-113.253x19.9695",
+    "-114.562x10.0229",
+    "-115x1.40834e-14",
+    "-114.562x-10.0229",
+    "-113.253x-19.9695",
+    "-111.081x-29.7642",
+    "-108.065x-39.3323",
+    "-104.225x-48.6011",
+    "-99.5929x-57.5",
+    "-94.2025x-65.9613",
+    "-88.0951x-73.9206",
+    "-81.3173x-81.3173",
+    "-73.9206x-88.0951",
+    "-65.9613x-94.2025",
+    "-57.5x-99.5929",
+    "-48.6011x-104.225",
+    "-39.3323x-108.065",
+    "-29.7642x-111.081",
+    "-19.9695x-113.253",
+    "-10.0229x-114.562",
+    "-2.11252e-14x-115",
+    "10.0229x-114.562",
+    "19.9695x-113.253",
+    "29.7642x-111.081",
+    "39.3323x-108.065",
+    "48.6011x-104.225",
+    "57.5x-99.5929",
+    "65.9613x-94.2025",
+    "73.9206x-88.0951",
+    "81.3173x-81.3173",
+    "88.0951x-73.9206",
+    "94.2025x-65.9613",
+    "99.5929x-57.5",
+    "104.225x-48.6011",
+    "108.065x-39.3323",
+    "111.081x-29.7642",
+    "113.253x-19.9695",
+    "114.562x-10.0229"
+  ],
+  "printable_height": "300",
+  "bed_exclude_area": [
+    "0x0"
+  ],
+  "best_object_pos": "0.5,0.5",
+  "max_layer_height": [
+    "0.32"
+  ],
+  "min_layer_height": [
+    "0.08"
+  ],
+  "retraction_length": [
+    "4"
+  ],
+  "retraction_speed": [
+    "35"
+  ],
+  "deretraction_speed": [
+    "35"
+  ],
+  "retraction_minimum_travel": [
+    "1.5"
+  ],
+  "retract_before_wipe": [
+    "70%"
+  ],
+  "retract_when_changing_layer": [
+    "1"
+  ],
+  "retract_restart_extra": [
+    "0"
+  ],
+  "wipe": [
+    "1"
+  ],
+  "wipe_distance": [
+    "2"
+  ],
+  "z_hop": [
+    "0.2"
+  ],
+  "z_hop_types": [
+    "Normal Lift"
+  ],
+  "retract_lift_enforce": [
+    "Top Only"
+  ],
+  "use_relative_e_distances": "1",
+  "use_firmware_retraction": "0",
+  "emit_machine_limits_to_gcode": "0",
+  "machine_max_speed_x": [
+    "200",
+    "200"
+  ],
+  "machine_max_speed_y": [
+    "200",
+    "200"
+  ],
+  "machine_max_speed_z": [
+    "200",
+    "30"
+  ],
+  "machine_max_speed_e": [
+    "60",
+    "60"
+  ],
+  "machine_max_acceleration_x": [
+    "3000",
+    "3000"
+  ],
+  "machine_max_acceleration_y": [
+    "3000",
+    "3000"
+  ],
+  "machine_max_acceleration_z": [
+    "3000",
+    "3000"
+  ],
+  "machine_max_acceleration_e": [
+    "5000",
+    "5000"
+  ],
+  "machine_max_acceleration_extruding": [
+    "3000",
+    "3000"
+  ],
+  "machine_max_acceleration_retracting": [
+    "3000",
+    "3000"
+  ],
+  "machine_max_acceleration_travel": [
+    "5000",
+    "5000"
+  ],
+  "machine_max_jerk_x": [
+    "8",
+    "8"
+  ],
+  "machine_max_jerk_y": [
+    "8",
+    "8"
+  ],
+  "machine_max_jerk_z": [
+    "0.4",
+    "0.4"
+  ],
+  "machine_max_jerk_e": [
+    "2.5",
+    "2.5"
+  ],
+  "nozzle_temperature_range_low": [
+    "0"
+  ],
+  "nozzle_temperature_range_high": [
+    "260"
+  ],
+  "machine_start_gcode": "'; ---- Anycubic Kossel Linear Plus (Klipper) ----\nM117 Initializing...\nM104 S[nozzle_temperature_initial_layer]\nM140 S[bed_temperature_initial_layer]\nG21\nG90\nM83\nM107\nG28\nM117 Warming up...\nM190 S[bed_temperature_initial_layer]\nM109 S[nozzle_temperature_initial_layer]\nBED_MESH_PROFILE LOAD=default\nM117 Priming...\nG1 Z5 F3000\nG1 X-60 Y-60 F6000\nG1 Z0.30 F300\nG92 E0\nG1 E10 F300\nG1 X5 Y-60 E8 F900\nG92 E0\nG1 Z1 F300\nG1 X0 Y0 F6000\nM117 Printing...\n",
+  "machine_end_gcode": "'; ---- Kossel end ----\nM117 Finishing...\nM104 S0\nM106 S0\nM140 S0\nG91\nG1 E-2 F1800\nG1 Z10 F3600\nG90\nG28\nM84\nM117 Ready!\n",
+  "machine_pause_gcode": "PAUSE\\n",
+  "change_filament_gcode": "PAUSE\\n",
+  "thumbnails": "48x48/PNG, 300x300/PNG",
+  "thumbnails_format": "PNG",
+  "extruder_colour": [
+    "#018001"
+  ],
+  "extruder_offset": [
+    "0x0"
+  ],
+  "auxiliary_fan": "0",
+  "support_multi_bed_types": "0",
+  "scan_first_layer": "0",
+  "z_offset": "0"
+}

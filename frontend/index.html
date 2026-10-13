@@ -47,24 +47,26 @@
     <section id="printer-settings" class="panel">
       <h2>Printer settings</h2>
       <div id="filament-panel" class="settings-section" hidden>
-        <h3>Filaments</h3>
-        <p class="muted">Orca stores nozzle and bed temperatures on the filament. The filament chosen here is used for every printer, unless that printer uses its own temperatures.</p>
-        <div class="toolbar">
-          <label>Filament for every printer<select id="filament-selected"></select></label>
-        </div>
-        <div class="toolbar">
-          <label>Add from Orca
-            <span class="path-field">
-              <input id="filament-search" spellcheck="false" placeholder="Search PLA, PETG, SUNLU…">
-              <span id="filament-search-status" class="search-status" role="status" aria-live="polite"></span>
-            </span>
-          </label>
-          <select id="filament-catalog"></select>
-          <button type="button" id="filament-add">Add</button>
-        </div>
-        <p id="filament-notice" class="muted"></p>
-        <div id="filament-list" class="list"></div>
-        <form id="filament-form" class="grid"></form>
+        <details id="filament-details">
+          <summary id="filament-summary">Filaments</summary>
+          <p class="filament-help">Orca stores nozzle and bed temperatures on the filament. The filament chosen here is used for every printer, unless that printer uses its own temperatures.</p>
+          <div class="toolbar">
+            <label>Filament for every printer<select id="filament-selected"></select></label>
+          </div>
+          <div class="toolbar">
+            <label>Add from Orca
+              <span class="path-field">
+                <input id="filament-search" spellcheck="false" placeholder="Search PLA, PETG, SUNLU…">
+                <span id="filament-search-status" class="search-status" role="status" aria-live="polite"></span>
+              </span>
+            </label>
+            <select id="filament-catalog"></select>
+            <button type="button" id="filament-add">Add</button>
+          </div>
+          <p id="filament-notice" class="filament-help"></p>
+          <div id="filament-list" class="list"></div>
+          <form id="filament-form" class="grid"></form>
+        </details>
       </div>
       <h3>Machine</h3>
       <p class="muted">Save for both engines stores one setup for Cura and Orca. Save for Cura or Save for Orca keeps the other engine on its current setup. Start and end scripts stay with the engine they came from until you copy them across.</p>
@@ -74,7 +76,7 @@
         <button type="button" id="pull-orca">Load from Orca</button>
         <button type="button" id="save-cura">Save for Cura</button>
         <button type="button" id="save-orca">Save for Orca</button>
-        <button type="button" id="save-owned" class="primary">Save for both engines</button>
+        <button type="button" id="save-owned">Save for both engines</button>
       </div>
       <p id="owned-notice" class="muted"></p>
       <form id="owned-form"></form>
@@ -121,6 +123,7 @@
             <button type="button" id="test-slice" class="primary">Test</button>
           </div>
           <p class="notice" id="layout-error"></p>
+          <p class="muted" id="layout-status"></p>
           <canvas id="preview"></canvas>
           <div id="pose-fields"></div>
         </div>
@@ -169,6 +172,6 @@
       <button type="button" id="browser-files">Slice selected files</button>
     </div>
   </dialog>
-  <script type="module" src="/app.js?v=21"></script>
+  <script type="module" src="/app.js?v=24"></script>
 </body>
 </html>

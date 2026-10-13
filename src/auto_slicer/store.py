@@ -268,12 +268,21 @@ def _normalize_group(group: dict[str, Any]) -> dict[str, Any]:
                     entry["rotation_z"] = float(position["rotation_z"])
                 normalized_manual[str(name)] = entry
     arranged = group.get("arranged_3mf")
+    by_offset_raw = group.get("arranged_3mf_by_offset")
+    by_offset: dict[str, str] | None = None
+    if isinstance(by_offset_raw, dict):
+        by_offset = {
+            str(key): str(value)
+            for key, value in by_offset_raw.items()
+            if value not in (None, "")
+        } or None
     return {
         "id": str(group.get("id") or uuid.uuid4().hex),
         "name": str(group.get("name") or "group"),
         "files": [str(item) for item in files],
         "manual_layout": normalized_manual,
         "arranged_3mf": str(arranged) if arranged else None,
+        "arranged_3mf_by_offset": by_offset,
     }
 
 

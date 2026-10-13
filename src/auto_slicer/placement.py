@@ -36,6 +36,31 @@ class Layout:
     bed_height: float
     items: tuple[PlacedPart, ...]
     error: str | None
+    status: str | None = None
+
+
+@dataclass(frozen=True)
+class PlacementZone:
+    """Axis-aligned printable zone in front-left bed coordinates."""
+
+    width: float
+    depth: float
+    origin_x: float = 0.0
+    origin_y: float = 0.0
+
+    @property
+    def center_x(self) -> float:
+        return self.origin_x + self.width / 2.0
+
+    @property
+    def center_y(self) -> float:
+        return self.origin_y + self.depth / 2.0
+
+
+def idex_zone(bed_width: float, bed_depth: float, offset_x: float) -> PlacementZone:
+    """Usable copy/mirror area: width = 2 * |offset_x|, full bed depth, origin at front-left."""
+    del bed_width  # full bed width is not the zone width
+    return PlacementZone(width=abs(offset_x) * 2.0, depth=bed_depth, origin_x=0.0, origin_y=0.0)
 
 
 def rotated_bounds(
@@ -75,8 +100,15 @@ def footprint_of(
     )
 
 
-def center_position(part: Footprint, bed_width: float, bed_depth: float) -> tuple[float, float]:
-    return (bed_width - part.width) / 2.0, (bed_depth - part.depth) / 2.0
+def center_position(
+    part: Footprint,
+    bed_width: float,
+    bed_depth: float,
+    zone: PlacementZone | None = None,
+) -> tuple[float, float]:
+    if zone is None:
+        return (bed_width - part.width) / 2.0, (bed_depth - part.depth) / 2.0
+    return zone.origin_x + (zone.width - part.width) / 2.0, zone.origin_y + (zone.depth - part.depth) / 2.0
 
 
 def place_single(
@@ -85,8 +117,40 @@ def place_single(
     bed_depth: float,
     bed_height: float,
     position: tuple[float, float] | None,
+    zone: PlacementZone | None = None,
 ) -> Layout:
-    min_x, min_y = position if position is not None else center_position(part, bed_width, bed_depth)
+    if position is not None:
+        min_x, min_y = position
+        placed = _placed(part, min_x, min_y)
+        error = _fit_error([placed], bed_width, bed_depth, bed_height, gap=0)
+        return Layout(bed_width, bed_depth, bed_height, (placed,), error)
+    if zone is not None:
+        min_x, min_y = center_position(part, bed_width, bed_depth, zone)
+        placed = _placed(part, min_x, min_y)
+        zone_error = _fit_error(
+            [placed],
+            zone.origin_x + zone.width,
+            zone.origin_y + zone.depth,
+            bed_height,
+            gap=0,
+            origin_x=zone.origin_x,
+            origin_y=zone.origin_y,
+        )
+        if zone_error is None:
+            return Layout(bed_width, bed_depth, bed_height, (placed,), None)
+        # Fall back to full bed centre with a status note.
+        min_x, min_y = center_position(part, bed_width, bed_depth)
+        placed = _placed(part, min_x, min_y)
+        error = _fit_error([placed], bed_width, bed_depth, bed_height, gap=0)
+        return Layout(
+            bed_width,
+            bed_depth,
+            bed_height,
+            (placed,),
+            error,
+            "IDEX offset zone too small; recentred on full bed",
+        )
+    min_x, min_y = center_position(part, bed_width, bed_depth)
     placed = _placed(part, min_x, min_y)
     error = _fit_error([placed], bed_width, bed_depth, bed_height, gap=0)
     return Layout(bed_width, bed_depth, bed_height, (placed,), error)
@@ -99,15 +163,36 @@ def place_group(
     bed_height: float,
     gap: float,
     manual: dict[str, tuple[float, float]] | None,
+    zone: PlacementZone | None = None,
 ) -> Layout:
     if not parts:
         return Layout(bed_width, bed_depth, bed_height, (), "group has no models")
+    pack_width = zone.width if zone is not None else bed_width
+    pack_depth = zone.depth if zone is not None else bed_depth
     if manual is None:
-        placed, pack_error = shelf_pack(parts, bed_width, bed_depth, gap)
+        placed, pack_error = shelf_pack(parts, pack_width, pack_depth, gap)
+        status = None
         if pack_error is None:
-            placed = center_group(placed, bed_width, bed_depth)
-        error = pack_error or _fit_error(placed, bed_width, bed_depth, bed_height, gap)
-        return Layout(bed_width, bed_depth, bed_height, tuple(placed), error)
+            placed = center_group(placed, bed_width, bed_depth, zone)
+            error = _fit_error(
+                placed,
+                (zone.origin_x + zone.width) if zone else bed_width,
+                (zone.origin_y + zone.depth) if zone else bed_depth,
+                bed_height,
+                gap,
+                origin_x=zone.origin_x if zone else 0.0,
+                origin_y=zone.origin_y if zone else 0.0,
+            )
+        elif zone is not None:
+            # Retry on the full bed when the IDEX zone cannot hold the pack.
+            placed, pack_error = shelf_pack(parts, bed_width, bed_depth, gap)
+            if pack_error is None:
+                placed = center_group(placed, bed_width, bed_depth)
+            error = pack_error or _fit_error(placed, bed_width, bed_depth, bed_height, gap)
+            status = "IDEX offset zone too small; recentred on full bed"
+        else:
+            error = pack_error or _fit_error(placed, bed_width, bed_depth, bed_height, gap)
+        return Layout(bed_width, bed_depth, bed_height, tuple(placed), error, status)
     placed = []
     missing = []
     for part in parts:
@@ -117,28 +202,53 @@ def place_group(
         min_x, min_y = manual[part.file]
         placed.append(_placed(part, min_x, min_y))
     error = None
+    status = None
     if missing:
         error = "manual layout is missing " + ", ".join(missing)
     else:
         # Keep relative spacing from arrange/manual edits, but centre the whole
-        # group on this printer's bed the same way a single STL is centred.
-        placed = center_group(placed, bed_width, bed_depth)
-        error = _fit_error(placed, bed_width, bed_depth, bed_height, gap)
-    return Layout(bed_width, bed_depth, bed_height, tuple(placed), error)
+        # group on this printer's bed (or IDEX zone) the same way a single STL is.
+        placed = center_group(placed, bed_width, bed_depth, zone)
+        if zone is not None:
+            zone_error = _fit_error(
+                placed,
+                zone.origin_x + zone.width,
+                zone.origin_y + zone.depth,
+                bed_height,
+                gap,
+                origin_x=zone.origin_x,
+                origin_y=zone.origin_y,
+            )
+            if zone_error is not None:
+                placed = center_group(placed, bed_width, bed_depth)
+                error = _fit_error(placed, bed_width, bed_depth, bed_height, gap)
+                status = "IDEX offset zone too small; recentred on full bed"
+            else:
+                error = None
+        else:
+            error = _fit_error(placed, bed_width, bed_depth, bed_height, gap)
+    return Layout(bed_width, bed_depth, bed_height, tuple(placed), error, status)
 
 
 def center_group(
-    placed: list[PlacedPart], bed_width: float, bed_depth: float
+    placed: list[PlacedPart],
+    bed_width: float,
+    bed_depth: float,
+    zone: PlacementZone | None = None,
 ) -> list[PlacedPart]:
-    """Translate placed parts so their combined footprint is bed-centred."""
+    """Translate placed parts so their combined footprint is bed- or zone-centred."""
     if not placed:
         return placed
     min_x = min(part.min_x for part in placed)
     min_y = min(part.min_y for part in placed)
     max_x = max(part.max_x for part in placed)
     max_y = max(part.max_y for part in placed)
-    dx = (bed_width - (max_x - min_x)) / 2.0 - min_x
-    dy = (bed_depth - (max_y - min_y)) / 2.0 - min_y
+    if zone is None:
+        dx = (bed_width - (max_x - min_x)) / 2.0 - min_x
+        dy = (bed_depth - (max_y - min_y)) / 2.0 - min_y
+    else:
+        dx = zone.origin_x + (zone.width - (max_x - min_x)) / 2.0 - min_x
+        dy = zone.origin_y + (zone.depth - (max_y - min_y)) / 2.0 - min_y
     if abs(dx) < 1e-9 and abs(dy) < 1e-9:
         return placed
     return [
@@ -196,11 +306,19 @@ def _fit_error(
     bed_depth: float,
     bed_height: float,
     gap: float,
+    *,
+    origin_x: float = 0.0,
+    origin_y: float = 0.0,
 ) -> str | None:
     for part in placed:
         if part.size_z > bed_height:
             return f"{part.file} is taller than the printer"
-        if part.min_x < -1e-6 or part.min_y < -1e-6 or part.max_x > bed_width + 1e-6 or part.max_y > bed_depth + 1e-6:
+        if (
+            part.min_x < origin_x - 1e-6
+            or part.min_y < origin_y - 1e-6
+            or part.max_x > bed_width + 1e-6
+            or part.max_y > bed_depth + 1e-6
+        ):
             return f"{part.file} is outside the bed"
     for index, left in enumerate(placed):
         for right in placed[index + 1 :]:

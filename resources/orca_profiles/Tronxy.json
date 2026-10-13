@@ -1,0 +1,25 @@
+{
+  "name": "Tronxy",
+  "version": "01.00.00.01",
+  "force_update": "0",
+  "description": "Auto Slicer bundled Tronxy Gemini S (Klipper IDEX)",
+  "machine_model_list": [
+    {
+      "name": "Tronxy Gemini S",
+      "sub_path": "machine/Tronxy Gemini S.json"
+    }
+  ],
+  "process_list": [
+    {
+      "name": "0.20mm Standard @Tronxy",
+      "sub_path": "process/0.20mm Standard @Tronxy.json"
+    }
+  ],
+  "filament_list": [],
+  "machine_list": [
+    {
+      "name": "Tronxy Gemini S 0.4 nozzle",
+      "sub_path": "machine/Tronxy Gemini S 0.4 nozzle.json"
+    }
+  ]
+}

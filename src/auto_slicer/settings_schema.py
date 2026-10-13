@@ -53,6 +53,8 @@ COMBING_MODES: tuple[CombingMode, ...] = ("off", "all", "noskin", "infill")
 SUPPORT_TYPES: tuple[SupportType, ...] = ("buildplate", "everywhere")
 SUPPORT_STRUCTURES: tuple[SupportStructure, ...] = ("normal", "tree")
 SLICER_ENGINES: tuple[SlicerEngine, ...] = ("cura", "orca")
+Z_HOP_TYPES: tuple[str, ...] = ("Normal Lift", "Slope Lift", "Spiral Lift", "Auto Lift")
+Z_HOP_ON_SURFACES: tuple[str, ...] = ("All Surfaces", "Top Only", "Bottom Only", "Top and Bottom")
 INFILL_PATTERNS: tuple[str, ...] = (
     "lightning",
     "gyroid",
@@ -96,6 +98,24 @@ class SliceSettings:
     infill_pattern: str = "lightning"
     infill_sparse_density: float = 5.0
     retraction_combing: CombingMode = "noskin"
+    travel_avoid_other_parts: bool = True
+    wall_thickness: float = 1.2
+    make_overhang_printable: bool = False
+    purge_line: bool = True
+    meshfix_maximum_resolution: float = 0.05
+    meshfix_maximum_deviation: float = 0.025
+    meshfix_maximum_travel_resolution: float = 0.2
+    meshfix_union_all: bool = True
+    orca_resolution: float = 0.012
+    precise_outer_wall: bool = True
+    precise_z_height: bool = True
+    enable_arc_fitting: bool = False
+    slice_closing_radius: float = 0.05
+    elephant_foot_compensation: float = 0.15
+    z_hop_enabled: bool = True
+    z_hop: float = 0.2
+    z_hop_type: str = "Normal Lift"
+    z_hop_on_surfaces: str = "Top Only"
     adhesion_type: AdhesionType = "brim"
     brim_width: float = 8.0
     skirt_line_count: int = 3
@@ -122,12 +142,28 @@ class SliceSettings:
         _enum(self.orca_seam, ORCA_SEAM_POSITIONS, "orca_seam")
         _enum(self.orca_scarf_joint, ORCA_SCARF_JOINTS, "orca_scarf_joint")
         _enum(self.retraction_combing, COMBING_MODES, "retraction_combing")
+        _enum(self.z_hop_type, Z_HOP_TYPES, "z_hop_type")
+        _enum(self.z_hop_on_surfaces, Z_HOP_ON_SURFACES, "z_hop_on_surfaces")
         _enum(self.adhesion_type, ADHESION_TYPES, "adhesion_type")
         _enum(self.slicer_engine, SLICER_ENGINES, "slicer_engine")
         _enum(self.support_type, SUPPORT_TYPES, "support_type")
         _enum(self.support_structure, SUPPORT_STRUCTURES, "support_structure")
         if self.infill_pattern not in INFILL_PATTERNS:
             raise ValueError(f"infill_pattern must be one of {', '.join(INFILL_PATTERNS)}")
+        if self.z_hop < 0:
+            raise ValueError("z_hop cannot be negative")
+        if self.wall_thickness <= 0:
+            raise ValueError("wall_thickness must be positive")
+        for key in (
+            "meshfix_maximum_resolution",
+            "meshfix_maximum_deviation",
+            "meshfix_maximum_travel_resolution",
+            "orca_resolution",
+            "slice_closing_radius",
+            "elephant_foot_compensation",
+        ):
+            if float(getattr(self, key)) < 0:
+                raise ValueError(f"{key} cannot be negative")
         if self.brim_width < 0 or self.skirt_line_count < 0 or self.raft_margin < 0:
             raise ValueError("adhesion sizes cannot be negative")
         if self.support_infill_rate < 0 or self.support_angle < 0:
@@ -144,6 +180,8 @@ class SliceSettings:
         settings = SliceSettings(**known)
         if "orca_seam" not in data:
             settings.orca_seam = _legacy_orca_seam(settings)
+        if "z_hop_enabled" not in data and "z_hop" in data:
+            settings.z_hop_enabled = float(data["z_hop"]) > 0
         settings.validate()
         return settings
 
@@ -153,6 +191,12 @@ def pack_gap(settings: SliceSettings) -> float:
     if settings.adhesion_type == "brim":
         return max(5.0, settings.brim_width)
     return 5.0
+
+
+def wall_loops_for(wall_thickness: float, nozzle_diameter: float = 0.4) -> int:
+    """Approximate Orca wall_loops from a Cura-style wall thickness."""
+    nozzle = max(float(nozzle_diameter), 0.01)
+    return max(1, int(round(float(wall_thickness) / nozzle)))
 
 
 def cura_setting_overrides(settings: SliceSettings) -> list[tuple[str, str]]:
@@ -166,6 +210,16 @@ def cura_setting_overrides(settings: SliceSettings) -> list[tuple[str, str]]:
         ("infill_pattern", settings.infill_pattern),
         ("infill_sparse_density", _number(settings.infill_sparse_density)),
         ("retraction_combing", settings.retraction_combing),
+        ("travel_avoid_other_parts", _as_bool(settings.travel_avoid_other_parts)),
+        ("wall_thickness", _number(settings.wall_thickness)),
+        ("conical_overhang_enabled", _as_bool(settings.make_overhang_printable)),
+        ("meshfix_maximum_resolution", _number(settings.meshfix_maximum_resolution)),
+        ("meshfix_maximum_deviation", _number(settings.meshfix_maximum_deviation)),
+        ("meshfix_maximum_travel_resolution", _number(settings.meshfix_maximum_travel_resolution)),
+        ("meshfix_union_all", _as_bool(settings.meshfix_union_all)),
+        ("xy_offset_layer_0", _number(-abs(settings.elephant_foot_compensation))),
+        ("retraction_hop", _number(settings.z_hop if settings.z_hop_enabled else 0.0)),
+        ("retraction_hop_enabled", _as_bool(settings.z_hop_enabled and settings.z_hop > 0)),
         ("adhesion_type", settings.adhesion_type),
         ("support_enable", _as_bool(settings.support_enable)),
         ("center_object", "false"),
@@ -240,7 +294,15 @@ def orca_setting_overrides(settings: SliceSettings) -> dict[str, str]:
         "seam_slope_conditional": "1" if settings.orca_scarf_conditional else "0",
         "sparse_infill_pattern": _ORCA_INFILL.get(settings.infill_pattern, settings.infill_pattern),
         "sparse_infill_density": f"{_number(settings.infill_sparse_density)}%",
-        "reduce_crossing_wall": "0" if settings.retraction_combing == "off" else "1",
+        "reduce_crossing_wall": "1" if settings.travel_avoid_other_parts else "0",
+        "wall_loops": str(wall_loops_for(settings.wall_thickness)),
+        "make_overhang_printable": "1" if settings.make_overhang_printable else "0",
+        "resolution": _number(settings.orca_resolution),
+        "precise_outer_wall": "1" if settings.precise_outer_wall else "0",
+        "precise_z_height": "1" if settings.precise_z_height else "0",
+        "enable_arc_fitting": "1" if settings.enable_arc_fitting else "0",
+        "slice_closing_radius": _number(settings.slice_closing_radius),
+        "elefant_foot_compensation": _number(settings.elephant_foot_compensation),
         "enable_support": "1" if settings.support_enable else "0",
         "brim_type": "no_brim",
         "brim_width": "0",

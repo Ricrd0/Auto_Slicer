@@ -28,6 +28,11 @@ const state = {
   filamentCatalog: [],
   filamentSearch: "idle",
   tempDraft: null,
+  zhopDraft: null,
+  combingDraft: null,
+  ownedBaseline: "",
+  selectedOwnedId: null,
+  catalogPollToken: 0,
   orcaCatalog: false,
   locations: { input_dir: "", output_dir: "", included: null },
   listing: null,
@@ -215,7 +220,9 @@ function effectiveRotation(file) {
 async function showLayout() {
   const printer = $("preview-printer").value;
   const error = $("layout-error");
+  const status = $("layout-status");
   error.textContent = "";
+  if (status) status.textContent = "";
   clearParts();
   if (!printer) {
     state.layoutItems = [];
@@ -244,11 +251,15 @@ async function showLayout() {
     setBed(layout.bed_width, layout.bed_depth);
     state.layoutItems = layout.items;
     if (layout.error) error.textContent = layout.error;
+    if (status && layout.status) status.textContent = layout.status;
     if (kind === "group") {
       const group = state.groups.find((entry) => entry.id === body.group_id);
       if (group) {
         if (layout.manual_layout) group.manual_layout = layout.manual_layout;
         if (layout.arranged_3mf !== undefined) group.arranged_3mf = layout.arranged_3mf;
+        if (layout.arranged_3mf_by_offset !== undefined) {
+          group.arranged_3mf_by_offset = layout.arranged_3mf_by_offset;
+        }
       }
     }
     for (const item of layout.items) {
@@ -556,10 +567,15 @@ function syncSettingsVisibility() {
   show('[data-cluster="orca-scarf"]', engine === "orca");
   show('[data-cluster="orca-scarf-conditional"]', engine === "orca" && scarf && scarf !== "none");
   show('[data-cluster="orca-arrange"]', engine === "orca");
+  show('[data-cluster="orca-precision"]', engine === "orca");
+  show('[data-cluster="cura-mesh"]', engine === "cura");
   show('[data-cluster="brim"]', adhesion === "brim");
   show('[data-cluster="skirt"]', adhesion === "skirt");
   show('[data-cluster="raft"]', adhesion === "raft");
   show('[data-cluster="supports"]', Boolean(supports));
+  const zhop = form.querySelector('[name="z_hop_enabled"]')?.checked;
+  show('[data-cluster="zhop-options"]', Boolean(zhop));
+  show('[data-cluster="zhop-orca"]', Boolean(zhop) && engine === "orca");
 }
 
 function renderSettings() {
@@ -621,9 +637,73 @@ function renderSettings() {
   appendFields(infill.grid, [
     ["infill_pattern", "Infill", "select", { options: options.infill_patterns, tip: "Pattern used inside the model." }],
     ["infill_sparse_density", "Infill density (%)", "number", { step: "1", tip: "How solid the interior is." }],
-    ["retraction_combing", "Combing", "select", { options: options.combing_modes, tip: "Keep travel moves inside the print to reduce stringing." }],
   ]);
   form.append(infill.section);
+
+  const walls = settingsSection("Walls & travel", "Shell thickness and travel behaviour. Combing can be overridden per printer.");
+  appendFields(walls.grid, [
+    ["wall_thickness", "Wall thickness (mm)", "number", { step: "0.1", tip: "Target shell thickness. About 1.2 mm is three lines with a 0.4 mm nozzle." }],
+    ["retraction_combing", "Combing", "select", { options: options.combing_modes, tip: "Keep travel moves inside the print (Not in Skin avoids scars on top surfaces)." }],
+    ["travel_avoid_other_parts", "Avoid printed parts while travelling", "checkbox", { tip: "Route travel around other parts (Cura) / avoid crossing walls (Orca)." }],
+    ["make_overhang_printable", "Make overhang printable", "checkbox", { tip: "Warp steep overhangs into printable cones. Off by default so geometry stays faithful." }],
+    ["purge_line", "Purge line on print start", "checkbox", { tip: "Appends a bed-edge purge to custom start G-code when missing. Leaves empty start G-code alone so Orca/Cura profile primes stay intact." }],
+  ]);
+  form.append(walls.section);
+
+  const mesh = settingsSection(
+    "Mesh fixes",
+    "Cura mesh simplification. Tuned for ~0.2 mm layers on calibrated direct-drive printers (finer than stock Cura).",
+  );
+  mesh.section.dataset.cluster = "cura-mesh";
+  mesh.section.classList.add("cluster");
+  appendFields(mesh.grid, [
+    ["meshfix_maximum_resolution", "Maximum resolution (mm)", "number", { step: "0.01", tip: "Longest allowed segment when simplifying the mesh outline." }],
+    ["meshfix_maximum_deviation", "Maximum deviation (mm)", "number", { step: "0.005", tip: "How far simplified paths may drift from the model." }],
+    ["meshfix_maximum_travel_resolution", "Maximum travel resolution (mm)", "number", { step: "0.05", tip: "Segment length allowed for travel moves." }],
+    ["meshfix_union_all", "Union overlapping volumes", "checkbox", { tip: "Merge overlapping meshes so intersections do not leave voids." }],
+    ["elephant_foot_compensation", "Elephant foot compensation (mm)", "number", { step: "0.05", tip: "Shrinks the first layer(s) to counter bed squish. Maps to Cura initial-layer XY offset and Orca elephant foot." }],
+  ]);
+  form.append(mesh.section);
+
+  const precision = settingsSection(
+    "Precision (Orca)",
+    "Orca path precision. Baseline for input-shaped, pressure-advance, linear-rail machines at 0.2 mm (also fine at 0.12 mm).",
+  );
+  precision.section.dataset.cluster = "orca-precision";
+  precision.section.classList.add("cluster");
+  appendFields(precision.grid, [
+    ["orca_resolution", "Resolution (mm)", "number", { step: "0.001", tip: "Contour simplification before g-code. Smaller keeps more detail; 0.012 is a solid quality default." }],
+    ["slice_closing_radius", "Slice gap closing radius (mm)", "number", { step: "0.01", tip: "Fills cracks smaller than 2× this radius while slicing." }],
+    ["precise_outer_wall", "Precise wall", "checkbox", { tip: "Zero overlap between outer and inner wall for better dimensional accuracy." }],
+    ["precise_z_height", "Precise Z height", "checkbox", { tip: "Adjusts the last layers so sliced height matches the model when it is not a multiple of layer height." }],
+    ["enable_arc_fitting", "Arc fitting (G2/G3)", "checkbox", { tip: "Off by default. Only enable if firmware arc support is configured (Klipper gcode_arcs resolution is coarse by default)." }],
+  ]);
+  form.append(precision.section);
+
+  const zhop = settingsSection("Z hop", "Shared travel lift. Individual printers can override this in Printer settings.");
+  const zhopEnable = field("z_hop_enabled", "Enable Z hop", "checkbox", {
+    tip: "Lift the nozzle during travel moves. Untick to disable Z hop entirely.",
+  });
+  const zhopHeight = field("z_hop", "Z hop height (mm)", "number", {
+    step: "0.1",
+    tip: "How high to lift during travel. Applies to every printer unless that printer overrides it.",
+  });
+  zhopHeight.dataset.cluster = "zhop-options";
+  zhopHeight.classList.add("cluster");
+  const zhopType = field("z_hop_type", "Z hop type", "select", {
+    options: options.z_hop_types,
+    tip: "Orca hop style (Normal / Slope / Spiral / Auto Lift).",
+  });
+  zhopType.dataset.cluster = "zhop-options";
+  zhopType.classList.add("cluster");
+  const zhopSurfaces = field("z_hop_on_surfaces", "On surfaces", "select", {
+    options: options.z_hop_on_surfaces,
+    tip: "Orca only: when Z hop applies over printed surfaces (Top Only is usually enough).",
+  });
+  zhopSurfaces.dataset.cluster = "zhop-orca";
+  zhopSurfaces.classList.add("cluster");
+  zhop.grid.append(zhopEnable, zhopHeight, zhopType, zhopSurfaces);
+  form.append(zhop.section);
 
   const adhesion = settingsSection("Bed adhesion", "Extra material on the bed to help the print stick.");
   const adhesionType = field("adhesion_type", "Bed adhesion", "select", { options: options.adhesion_types, tip: "None, skirt, brim, or raft." });
@@ -701,9 +781,13 @@ async function saveSettings() {
   if ($("models").classList.contains("active")) await showLayout();
 }
 
-async function loadPrinters() {
+async function loadPrinters({ refresh = false } = {}) {
   const catalog = state.settings?.slicer_engine === "orca" && state.orcaCatalog;
-  state.printers = await api(`/api/printers${catalog ? "?catalog=true" : ""}`);
+  const params = new URLSearchParams();
+  if (catalog) params.set("catalog", "true");
+  if (refresh) params.set("refresh", "true");
+  const query = params.toString() ? `?${params}` : "";
+  state.printers = await api(`/api/printers${query}`);
   renderPrinters();
 }
 
@@ -720,11 +804,13 @@ function renderPrinters() {
         ? `No printers in ${root}. Cura keeps machine profiles in a version folder such as %APPDATA%\\cura\\5.13 (the folder that contains machine_instances).`
         : "No printers found.";
   } else if (engine === "orca" && !state.orcaCatalog) {
-    notice.textContent = `Showing the ${state.printers.length} Orca profiles linked to your printers${root ? ` from ${root}` : ""}.`;
+    notice.textContent = `Showing your ${state.printers.length} printers${root ? ` (Orca profiles from ${root})` : ""}. Machines without an Orca link appear here but cannot slice until linked in Printer settings.`;
   } else if (engine === "orca") {
     notice.textContent = `Showing every Orca printer${root ? ` from ${root}` : ""}. Add a machine to keep it in the default list.`;
   } else {
-    notice.textContent = root ? `Loaded from ${root}` : "";
+    notice.textContent = root
+      ? `Loaded from ${root}. Owned printers without a Cura profile are listed too.`
+      : "Owned printers and any Cura machines found locally.";
   }
   const body = $("printer-rows");
   body.innerHTML = "";
@@ -1293,6 +1379,15 @@ const OWNED_SECTIONS = [
     ["heated_bed", "Heated bed", "checkbox"],
     ["gcode_flavor", "G-code flavor", "select"],
   ]],
+  ["IDEX", [
+    ["printer_short_id", "Printer ID acronym", "text"],
+    ["idex_offset_enabled", "Apply IDEX offset", "checkbox"],
+    ["idex_offset_x", "Copy/mirror offset X (mm)", "number", "0.1"],
+    ["idex_copy_mode", "Copy mode (Klipper)", "checkbox"],
+    ["idex_mirror_mode", "Mirror mode (Klipper)", "checkbox"],
+    ["filament_id_t1", "Second head filament", "filament"],
+    ["extruder_count", "Extruder count", "number", "1"],
+  ]],
   ["Temperatures", [
     ["temperature_override", "Use this printer's temperatures", "checkbox"],
     ["nozzle_temperature", "Nozzle temperature (°C)", "number", "1"],
@@ -1301,23 +1396,48 @@ const OWNED_SECTIONS = [
     ["bed_temperature_initial", "Initial bed temperature (°C)", "number", "1"],
   ]],
   ["Speeds", [
-    ["retraction_length", "Retraction length (mm)", "number", "0.1"],
-    ["retraction_speed", "Retraction speed (mm/s)", "number", "1"],
+    ["print_speed", "Print speed (mm/s)", "number", "1"],
+    ["outer_wall_speed", "Outer wall speed (mm/s)", "number", "1"],
+    ["inner_wall_speed", "Inner wall speed (mm/s)", "number", "1"],
+    ["infill_speed", "Infill speed (mm/s)", "number", "1"],
+    ["initial_layer_speed", "Initial layer speed (mm/s)", "number", "1"],
     ["travel_speed", "Travel speed (mm/s)", "number", "1"],
   ]],
+  ["Retraction", [
+    ["retraction_length", "Retraction length (mm)", "number", "0.1"],
+    ["retraction_speed", "Retraction speed (mm/s)", "number", "1"],
+    ["retraction_min_travel", "Retraction minimum travel (mm)", "number", "0.1"],
+    ["retraction_extrusion_window", "Minimum extrusion distance window (mm)", "number", "0.1"],
+    ["retraction_combing_max_distance", "Max comb distance with no retract (mm)", "number", "0.1"],
+    ["combing_override", "Use this printer's combing", "checkbox"],
+    ["retraction_combing", "Combing", "select"],
+  ]],
   ["Z hop", [
+    ["z_hop_override", "Use this printer's Z hop", "checkbox"],
+    ["z_hop_enabled", "Enable Z hop", "checkbox"],
     ["z_hop", "Z hop height (mm)", "number", "0.1"],
     ["z_hop_type", "Z hop type", "select"],
+    ["z_hop_on_surfaces", "On surfaces", "select"],
   ]],
 ];
 
 function selectedOwned() {
-  return (state.owned?.printers || []).find((item) => item.id === $("owned-printer").value) || null;
+  const id = state.selectedOwnedId || $("owned-printer").value;
+  return (state.owned?.printers || []).find((item) => item.id === id) || null;
 }
 
-function renderOwned() {
+function ownedFormDirty() {
+  if (!selectedOwned() || !state.ownedBaseline) return false;
+  try {
+    return serializeOwnedForm() !== state.ownedBaseline;
+  } catch {
+    return false;
+  }
+}
+
+function renderOwned({ rebuildForm = true } = {}) {
   const select = $("owned-printer");
-  const previous = select.value;
+  const preferred = state.selectedOwnedId || select.value;
   select.innerHTML = "";
   for (const printer of state.owned?.printers || []) {
     const option = document.createElement("option");
@@ -1325,8 +1445,25 @@ function renderOwned() {
     option.textContent = printer.name;
     select.append(option);
   }
-  if ([...select.options].some((option) => option.value === previous)) select.value = previous;
-  renderOwnedForm();
+  if (preferred && [...select.options].some((option) => option.value === preferred)) {
+    select.value = preferred;
+    state.selectedOwnedId = preferred;
+  } else if (select.options.length) {
+    select.value = select.options[0].value;
+    state.selectedOwnedId = select.value;
+  } else {
+    state.selectedOwnedId = null;
+  }
+  if (rebuildForm) renderOwnedForm();
+}
+
+function replaceOwnedRecord(saved) {
+  const printers = [...(state.owned?.printers || [])];
+  const index = printers.findIndex((item) => item.id === saved.id);
+  if (index >= 0) printers[index] = { ...printers[index], ...saved };
+  else printers.push(saved);
+  state.owned = { ...state.owned, printers };
+  state.selectedOwnedId = saved.id;
 }
 
 function selectedFilament() {
@@ -1346,6 +1483,8 @@ function renderOwnedForm() {
   notice.textContent = ownedNotice(printer);
   const settings = displayedSettings(printer);
   state.tempDraft = null;
+  state.zhopDraft = null;
+  state.combingDraft = null;
   for (const [title, fields] of OWNED_SECTIONS) {
     const section = document.createElement("fieldset");
     section.className = "settings-section";
@@ -1355,12 +1494,26 @@ function renderOwnedForm() {
     const grid = document.createElement("div");
     grid.className = "grid";
     if (title === "Machine configuration") grid.append(orcaProfileField(printer));
-    for (const spec of fields) grid.append(ownedField(spec, settings));
+    for (const spec of fields) {
+      if (title === "IDEX" && !shouldShowIdexField(spec[0], settings)) continue;
+      grid.append(ownedField(spec, settings));
+    }
+    if (title === "IDEX") {
+      const hint = document.createElement("p");
+      hint.className = "muted span-2";
+      hint.textContent = Number(settings.extruder_count || 1) > 1
+        ? "Apply IDEX offset centres models in the copy/mirror zone (width = 2 × |offset X|; typically −bed width / 2). Copy/Mirror inject Klipper macros and suffix outputs with _copy / _mirror."
+        : "IDEX options appear when extruder count is 2.";
+      grid.append(hint);
+    }
     if (title === "Temperatures") {
       const hint = document.createElement("p");
       hint.id = "temperature-note";
       hint.className = "muted span-2";
       grid.append(hint);
+    }
+    if (title === "IDEX" && Number(settings.extruder_count || 1) <= 1 && !grid.querySelector("label")) {
+      continue;
     }
     section.append(grid);
     form.append(section);
@@ -1404,6 +1557,47 @@ function renderOwnedForm() {
   });
   form.elements.temperature_override.addEventListener("change", () => syncTemperatureFields(true));
   syncTemperatureFields(false);
+  if (form.elements.z_hop_override) {
+    form.elements.z_hop_override.addEventListener("change", () => syncZHopFields(true));
+  }
+  if (form.elements.z_hop_enabled) {
+    form.elements.z_hop_enabled.addEventListener("change", () => syncOwnedZHopVisibility(form));
+  }
+  if (form.elements.combing_override) {
+    form.elements.combing_override.addEventListener("change", () => syncCombingFields(true));
+  }
+  syncZHopFields(false);
+  syncCombingFields(false);
+  wireIdexCoupling(form);
+  wireOwnedDirtyTracking(form);
+}
+
+function shouldShowIdexField(name, settings) {
+  const dual = Number(settings.extruder_count || 1) > 1;
+  if (!dual && name !== "extruder_count") return false;
+  if ((name === "idex_copy_mode" || name === "idex_mirror_mode") && settings.gcode_flavor !== "Klipper") {
+    return false;
+  }
+  return true;
+}
+
+function wireIdexCoupling(form) {
+  const apply = form.elements.idex_offset_enabled;
+  const copy = form.elements.idex_copy_mode;
+  const mirror = form.elements.idex_mirror_mode;
+  if (!apply) return;
+  const syncFromModes = () => {
+    if ((copy && copy.checked) || (mirror && mirror.checked)) apply.checked = true;
+  };
+  const syncFromApply = () => {
+    if (!apply.checked) {
+      if (copy) copy.checked = false;
+      if (mirror) mirror.checked = false;
+    }
+  };
+  apply.addEventListener("change", syncFromApply);
+  if (copy) copy.addEventListener("change", syncFromModes);
+  if (mirror) mirror.addEventListener("change", syncFromModes);
 }
 
 function orcaProfileField(printer) {
@@ -1429,12 +1623,26 @@ function orcaProfileField(printer) {
 function ownedField([name, label, type, step], settings) {
   const wrap = document.createElement("label");
   wrap.textContent = label;
-  const input = document.createElement(type === "select" ? "select" : "input");
+  const input = document.createElement(
+    type === "select" || type === "filament" ? "select" : "input"
+  );
   input.name = name;
   if (type === "checkbox") {
     input.type = "checkbox";
     input.checked = Boolean(settings[name]);
     wrap.classList.add("inline");
+  } else if (type === "filament") {
+    const empty = document.createElement("option");
+    empty.value = "";
+    empty.textContent = "Same as primary filament";
+    input.append(empty);
+    for (const filament of state.filaments?.filaments || []) {
+      const option = document.createElement("option");
+      option.value = filament.id;
+      option.textContent = filament.name;
+      input.append(option);
+    }
+    input.value = settings[name] || "";
   } else if (type === "select") {
     const options = selectOptionsForField(name);
     for (const value of options) {
@@ -1444,6 +1652,9 @@ function ownedField([name, label, type, step], settings) {
       input.append(option);
     }
     input.value = settings[name] || options[0] || "";
+  } else if (type === "text") {
+    input.type = "text";
+    input.value = settings[name] ?? "";
   } else {
     input.type = "number";
     input.step = step;
@@ -1456,16 +1667,64 @@ function ownedField([name, label, type, step], settings) {
     hint.textContent = "Orca writes Klipper. Cura has no Klipper flavor, so a Cura slice uses Marlin gcode, which Klipper runs.";
     wrap.append(hint);
   }
+  if (name === "z_hop_override") {
+    const hint = document.createElement("span");
+    hint.className = "muted";
+    hint.textContent = "Off uses the shared Z hop from Slice settings. On keeps the values saved for this printer.";
+    wrap.append(hint);
+  }
+  if (name === "z_hop_enabled") {
+    const hint = document.createElement("span");
+    hint.className = "muted";
+    hint.textContent = "Untick to disable Z hop for this printer (or for every printer when using shared settings).";
+    wrap.append(hint);
+  }
   if (name === "z_hop") {
     const hint = document.createElement("span");
     hint.className = "muted";
-    hint.textContent = "0 disables Z hop. Orca also gets the hop type below; Cura enables retraction hop when height is above 0.";
+    hint.textContent = "How high to lift during travel. Orca also uses hop type and On surfaces below.";
     wrap.append(hint);
   }
   if (name === "z_hop_type") {
     const hint = document.createElement("span");
     hint.className = "muted";
     hint.textContent = "Used by Orca (Normal / Slope / Spiral / Auto Lift).";
+    wrap.append(hint);
+  }
+  if (name === "z_hop_on_surfaces") {
+    const hint = document.createElement("span");
+    hint.className = "muted";
+    hint.textContent = "Orca only: All Surfaces, Top Only, Bottom Only, or Top and Bottom.";
+    wrap.append(hint);
+  }
+  if (name === "print_speed") {
+    const hint = document.createElement("span");
+    hint.className = "muted";
+    hint.textContent = "Cura default print speed. Orca uses the wall and infill speeds below.";
+    wrap.append(hint);
+  }
+  if (name === "retraction_min_travel") {
+    const hint = document.createElement("span");
+    hint.className = "muted";
+    hint.textContent = "Cura: skip retraction for travels shorter than this.";
+    wrap.append(hint);
+  }
+  if (name === "retraction_extrusion_window") {
+    const hint = document.createElement("span");
+    hint.className = "muted";
+    hint.textContent = "Cura: filament length for max-retraction-count. For direct drive, roughly match retraction length.";
+    wrap.append(hint);
+  }
+  if (name === "retraction_combing_max_distance") {
+    const hint = document.createElement("span");
+    hint.className = "muted";
+    hint.textContent = "Cura: 0 keeps combing unretracted; a positive value forces retract on longer comb moves.";
+    wrap.append(hint);
+  }
+  if (name === "combing_override") {
+    const hint = document.createElement("span");
+    hint.className = "muted";
+    hint.textContent = "Off uses shared Combing from Slice settings.";
     wrap.append(hint);
   }
   if (name === "temperature_override") {
@@ -1476,11 +1735,27 @@ function ownedField([name, label, type, step], settings) {
       : "Off uses the shared filament. That list is edited while Orca is the slicing engine.";
     wrap.append(hint);
   }
+  if (name === "idex_offset_enabled") {
+    const hint = document.createElement("span");
+    hint.className = "muted";
+    hint.textContent = "When on, placement uses the copy/mirror zone centred at offset X. Unticking clears Copy/Mirror.";
+    wrap.append(hint);
+  }
+  if (name === "idex_copy_mode" || name === "idex_mirror_mode") {
+    const hint = document.createElement("span");
+    hint.className = "muted";
+    hint.textContent = "Enabling this turns on Apply IDEX offset and suffixes gcode with _copy or _mirror.";
+    wrap.append(hint);
+  }
   return wrap;
 }
 
 function selectOptionsForField(name) {
   if (name === "z_hop_type") return state.options.z_hop_types || ["Normal Lift"];
+  if (name === "retraction_combing") return state.options.combing_modes || ["off", "all", "noskin", "infill"];
+  if (name === "z_hop_on_surfaces") {
+    return state.options.z_hop_on_surfaces || ["All Surfaces", "Top Only", "Bottom Only", "Top and Bottom"];
+  }
   if (name === "gcode_flavor") return state.options.gcode_flavors || ["Marlin"];
   return [];
 }
@@ -1501,6 +1776,102 @@ function syncTemperatureFields(fromToggle) {
   }
   const note = $("temperature-note");
   if (note) note.textContent = temperatureNote(override, filament, source);
+}
+
+const ZHOP_FIELDS = ["z_hop_enabled", "z_hop", "z_hop_type", "z_hop_on_surfaces"];
+
+function syncZHopFields(fromToggle) {
+  const form = $("owned-form");
+  const printer = selectedOwned();
+  if (!form?.elements?.z_hop_override || !printer) return;
+  const override = form.elements.z_hop_override.checked;
+  if (fromToggle && !override) state.zhopDraft = readZHop(form);
+  const shared = state.settings || {};
+  const source = override
+    ? (state.zhopDraft || displayedSettings(printer) || {})
+    : shared;
+  for (const name of ZHOP_FIELDS) {
+    const input = form.elements[name];
+    if (!input) continue;
+    input.disabled = !override;
+    if (!override || (fromToggle && override)) {
+      if (input.type === "checkbox") input.checked = Boolean(source[name]);
+      else input.value = source[name] ?? "";
+    }
+  }
+  syncOwnedZHopVisibility(form);
+}
+
+function syncOwnedZHopVisibility(form) {
+  const enabled = form.elements.z_hop_enabled?.checked;
+  const orca = state.settings?.slicer_engine === "orca";
+  for (const name of ["z_hop", "z_hop_type"]) {
+    const input = form.elements[name];
+    if (!input) continue;
+    input.closest("label")?.classList.toggle("cluster", true);
+    input.closest("label").hidden = !enabled;
+  }
+  const surfaces = form.elements.z_hop_on_surfaces;
+  if (surfaces) {
+    surfaces.closest("label").hidden = !(enabled && orca);
+  }
+}
+
+function readZHop(form) {
+  return {
+    z_hop_enabled: Boolean(form.elements.z_hop_enabled?.checked),
+    z_hop: form.elements.z_hop ? Number(form.elements.z_hop.value) : 0.2,
+    z_hop_type: form.elements.z_hop_type?.value || "Normal Lift",
+    z_hop_on_surfaces: form.elements.z_hop_on_surfaces?.value || "Top Only",
+  };
+}
+
+function syncCombingFields(fromToggle) {
+  const form = $("owned-form");
+  const printer = selectedOwned();
+  if (!form?.elements?.combing_override || !printer) return;
+  const override = form.elements.combing_override.checked;
+  if (fromToggle && !override) state.combingDraft = readCombing(form);
+  const shared = state.settings || {};
+  const source = override
+    ? (state.combingDraft || displayedSettings(printer) || {})
+    : shared;
+  const input = form.elements.retraction_combing;
+  if (!input) return;
+  input.disabled = !override;
+  if (!override || (fromToggle && override)) {
+    input.value = source.retraction_combing ?? "noskin";
+  }
+}
+
+function readCombing(form) {
+  return {
+    retraction_combing: form.elements.retraction_combing?.value || "noskin",
+  };
+}
+
+function wireOwnedDirtyTracking(form) {
+  state.ownedBaseline = serializeOwnedForm();
+  updateOwnedSaveHighlight();
+  for (const input of form.querySelectorAll("input, select, textarea")) {
+    input.addEventListener("input", updateOwnedSaveHighlight);
+    input.addEventListener("change", updateOwnedSaveHighlight);
+  }
+}
+
+function serializeOwnedForm() {
+  try {
+    return JSON.stringify(ownedPayload());
+  } catch {
+    return "";
+  }
+}
+
+function updateOwnedSaveHighlight() {
+  const dirty = Boolean(selectedOwned()) && serializeOwnedForm() !== state.ownedBaseline;
+  for (const id of ["save-owned", "save-cura", "save-orca"]) {
+    $(id).classList.toggle("primary", dirty);
+  }
 }
 
 function readTemperatures(form) {
@@ -1549,6 +1920,15 @@ function renderFilaments() {
   const list = $("filament-list");
   list.innerHTML = "";
   const filaments = state.filaments?.filaments || [];
+  const selected = selectedFilament();
+  const summary = $("filament-summary");
+  if (summary) {
+    summary.textContent = selected
+      ? `Filaments — ${selected.name}: nozzle ${selected.nozzle_temperature}° / ${selected.nozzle_temperature_initial}° · bed ${selected.bed_temperature}° / ${selected.bed_temperature_initial}°`
+      : filaments.length
+        ? "Filaments — expand to choose or edit"
+        : "Filaments — expand to add from Orca";
+  }
   $("filament-notice").textContent = filaments.length
     ? "Select a row to edit its temperatures. Adding a filament selects it for every printer when none is selected yet."
     : "Search the Orca catalog and add the filaments you print with.";
@@ -1667,10 +2047,22 @@ function ownedPayload() {
   const settings = { ...(displayedSettings(printer)) };
   for (const input of form.querySelectorAll("input, select, textarea")) {
     if (input.name === "orca_id" || input.disabled) continue;
-    settings[input.name] = input.type === "checkbox" ? input.checked : input.type === "number" ? Number(input.value) : input.value;
+    if (input.type === "checkbox") settings[input.name] = input.checked;
+    else if (input.type === "number") settings[input.name] = Number(input.value);
+    else if (input.name === "filament_id_t1") settings[input.name] = input.value || null;
+    else settings[input.name] = input.value;
   }
+  if (!form.elements.idex_offset_enabled) settings.idex_offset_enabled = false;
+  if (!form.elements.idex_copy_mode) settings.idex_copy_mode = false;
+  if (!form.elements.idex_mirror_mode) settings.idex_mirror_mode = false;
   if (!settings.temperature_override && state.tempDraft) {
     Object.assign(settings, state.tempDraft);
+  }
+  if (!settings.z_hop_override && state.zhopDraft) {
+    Object.assign(settings, state.zhopDraft);
+  }
+  if (!settings.combing_override && state.combingDraft) {
+    Object.assign(settings, state.combingDraft);
   }
   return {
     ...printer,
@@ -1679,23 +2071,50 @@ function ownedPayload() {
   };
 }
 
-$("owned-printer").addEventListener("change", renderOwnedForm);
+$("owned-printer").addEventListener("change", () => {
+  const select = $("owned-printer");
+  const nextId = select.value;
+  if (nextId === state.selectedOwnedId) return;
+  if (ownedFormDirty() && !confirm("Discard unsaved changes for this printer?")) {
+    select.value = state.selectedOwnedId || "";
+    return;
+  }
+  state.selectedOwnedId = nextId;
+  renderOwnedForm();
+});
 $("save-cura").addEventListener("click", () => saveOwned("cura"));
 $("save-orca").addEventListener("click", () => saveOwned("orca"));
 $("save-owned").addEventListener("click", () => saveOwned("both"));
 
 async function saveOwned(scope) {
-  const saved = await api("/api/owned", { method: "PUT", body: JSON.stringify({ ...ownedPayload(), scope }) });
-  state.owned = await api("/api/owned");
-  $("owned-printer").value = saved.id;
-  if (scope === "both") {
-    renderOwned();
-  } else {
+  const payload = ownedPayload();
+  if (!payload?.id) return;
+  const saveButtons = ["save-owned", "save-cura", "save-orca"].map((id) => $(id));
+  for (const button of saveButtons) button.disabled = true;
+  try {
+    const saved = await api("/api/owned", {
+      method: "PUT",
+      body: JSON.stringify({ ...payload, scope }),
+    });
+    replaceOwnedRecord(saved);
+    $("owned-printer").value = saved.id;
+    // Re-render so the form shows the bag that was actually saved (shared / Cura / Orca).
+    renderOwnedForm();
+    const engine = state.settings?.slicer_engine || "cura";
+    let label =
+      scope === "both" ? "Saved for both engines." : scope === "cura" ? "Saved for Cura." : "Saved for Orca.";
+    if (scope !== "both" && scope !== engine) {
+      label += ` The form still shows the ${engine === "orca" ? "Orca" : "Cura"} view.`;
+    }
     const printer = selectedOwned();
-    const label = scope === "cura" ? "Saved for Cura." : "Saved for Orca.";
     if (printer) $("owned-notice").textContent = ownedNotice(printer, label);
+    state.ownedBaseline = serializeOwnedForm();
+    updateOwnedSaveHighlight();
+  } catch (error) {
+    $("owned-notice").textContent = `Save failed: ${error.message || error}`;
+  } finally {
+    for (const button of saveButtons) button.disabled = false;
   }
-  if (state.settings?.slicer_engine === "orca") await loadPrinters();
 }
 
 $("pull-cura").addEventListener("click", async () => {
@@ -1780,11 +2199,34 @@ $("orca-catalog").addEventListener("change", async (event) => {
 });
 
 $("refresh-printers").addEventListener("click", async () => {
-  state.health = await api("/api/health");
-  state.owned = await api("/api/owned");
-  await loadPrinters();
-  renderOwned();
+  $("engine-status").textContent = "Refreshing printers…";
+  try {
+    state.health = await api("/api/health");
+    const owned = await api("/api/owned");
+    state.owned = {
+      ...owned,
+      printers: ownedFormDirty()
+        ? mergeOwnedPrinterLists(state.owned.printers, owned.printers)
+        : owned.printers,
+    };
+    await loadPrinters({ refresh: false });
+    renderOwned({ rebuildForm: !ownedFormDirty() });
+  } finally {
+    const curaReady = state.health?.cura_engine || state.health?.engine;
+    $("engine-status").textContent = `${curaReady ? "CuraEngine ready" : "CuraEngine was not found"} · ${state.health?.orca_engine ? "OrcaSlicer ready" : "OrcaSlicer was not found"}`;
+  }
 });
+
+function mergeOwnedPrinterLists(current, incoming) {
+  const currentById = new Map((current || []).map((item) => [item.id, item]));
+  // Keep the in-memory record the user is editing; refresh everyone else from the server.
+  return (incoming || []).map((item) => {
+    if (item.id === state.selectedOwnedId && ownedFormDirty()) {
+      return currentById.get(item.id) || item;
+    }
+    return item;
+  });
+}
 $("upload-bundle").addEventListener("change", async (event) => {
   const file = event.target.files[0];
   if (!file) return;
@@ -1970,37 +2412,109 @@ $("reset-gcode-view").addEventListener("click", () => {
   drawLayer(Number($("layer-slider").value), true);
 });
 
-const boot = await Promise.all([
-  api("/api/health"),
-  api("/api/options"),
-  api("/api/settings"),
-  api("/api/printers"),
-  api("/api/models"),
-  api("/api/locations"),
-  api("/api/groups"),
-  api("/api/poses"),
-  api("/api/jobs/current"),
-  api("/api/owned"),
-  api("/api/filaments"),
-]);
-const curaReady = boot[0].cura_engine || boot[0].engine;
-$("engine-status").textContent = `${curaReady ? "CuraEngine ready" : "CuraEngine was not found"} · ${boot[0].orca_engine ? "OrcaSlicer ready" : "OrcaSlicer was not found"}`;
-state.health = boot[0];
-state.options = boot[1];
-state.settings = boot[2];
-state.printers = boot[3];
-state.owned = boot[9];
-state.filaments = boot[10];
-state.filamentEdit = boot[10].filaments[0]?.id || null;
-state.models = boot[4];
-state.locations = boot[5];
-state.groups = boot[6].groups;
-state.poses = boot[7];
-renderSettings();
-renderPrinters();
-renderOwned();
-renderPaths();
-renderModels();
-renderJob(boot[8]);
-await showLayout();
-if (boot[8].status === "running" || boot[8].status === "queued") pollJob();
+try {
+  // Fast paths first so the header updates even while Orca catalog discovery runs.
+  const early = await Promise.all([
+    api("/api/health"),
+    api("/api/options"),
+    api("/api/settings"),
+    api("/api/models"),
+    api("/api/locations"),
+    api("/api/groups"),
+    api("/api/poses"),
+    api("/api/jobs/current"),
+    api("/api/filaments"),
+  ]);
+  const curaReady = early[0].cura_engine || early[0].engine;
+  $("engine-status").textContent = `${curaReady ? "CuraEngine ready" : "CuraEngine was not found"} · ${early[0].orca_engine ? "OrcaSlicer ready" : "OrcaSlicer was not found"} · Loading printers…`;
+  state.health = early[0];
+  state.options = early[1];
+  state.settings = early[2];
+  state.models = early[3];
+  state.locations = early[4];
+  state.groups = early[5].groups;
+  state.poses = early[6];
+  state.filaments = early[8];
+  state.filamentEdit = early[8].filaments[0]?.id || null;
+  renderSettings();
+  renderPaths();
+  renderModels();
+  renderJob(early[7]);
+  renderFilaments();
+
+  const [printers, owned] = await Promise.all([
+    api(`/api/printers${state.settings?.slicer_engine === "orca" && state.orcaCatalog ? "?catalog=true" : ""}`),
+    api("/api/owned"),
+  ]);
+  state.printers = printers;
+  state.owned = owned;
+  if (!state.selectedOwnedId && owned.printers?.[0]) {
+    state.selectedOwnedId = owned.printers[0].id;
+  }
+  const engineLabel = `${curaReady ? "CuraEngine ready" : "CuraEngine was not found"} · ${early[0].orca_engine ? "OrcaSlicer ready" : "OrcaSlicer was not found"}`;
+  const catalogLoading = printers.some((printer) => (printer.warnings || []).some((warning) => /catalog still loading|profile details still loading/i.test(warning)));
+  $("engine-status").textContent = catalogLoading ? `${engineLabel} · Loading Orca catalog…` : engineLabel;
+  renderPrinters();
+  renderOwned();
+  await showLayout();
+  if (early[7].status === "running" || early[7].status === "queued") pollJob();
+  if (catalogLoading) {
+    state.catalogPollToken += 1;
+    pollCatalogReady(engineLabel, state.catalogPollToken);
+  }
+} catch (error) {
+  $("engine-status").textContent = `Failed to load: ${error.message || error}`;
+}
+
+async function pollCatalogReady(engineLabel, token, attempt = 0) {
+  if (token !== state.catalogPollToken || attempt > 36) {
+    if (token === state.catalogPollToken) $("engine-status").textContent = engineLabel;
+    return;
+  }
+  await new Promise((resolve) => setTimeout(resolve, 5000));
+  if (token !== state.catalogPollToken) return;
+  try {
+    // Refresh the Printers page only — do not rebuild the printer-settings form
+    // (that was wiping edits and fighting the selected printer).
+    await loadPrinters({ refresh: false });
+    const owned = await api("/api/owned");
+    if (token !== state.catalogPollToken) return;
+    state.owned = {
+      ...owned,
+      printers: ownedFormDirty()
+        ? mergeOwnedPrinterLists(state.owned.printers, owned.printers)
+        : owned.printers,
+      orca_profiles: owned.orca_profiles,
+    };
+    renderOwned({ rebuildForm: false });
+    refreshOrcaProfileSelect();
+    const stillLoading = state.printers.some((printer) =>
+      (printer.warnings || []).some((warning) => /catalog still loading|profile details still loading/i.test(warning))
+    );
+    if (stillLoading) {
+      $("engine-status").textContent = `${engineLabel} · Loading Orca catalog…`;
+      return pollCatalogReady(engineLabel, token, attempt + 1);
+    }
+    $("engine-status").textContent = engineLabel;
+  } catch {
+    if (token === state.catalogPollToken) $("engine-status").textContent = engineLabel;
+  }
+}
+
+function refreshOrcaProfileSelect() {
+  const select = $("owned-form")?.elements?.orca_id;
+  if (!select) return;
+  const previous = select.value;
+  select.innerHTML = "";
+  const empty = document.createElement("option");
+  empty.value = "";
+  empty.textContent = "None";
+  select.append(empty);
+  for (const profile of state.owned.orca_profiles || []) {
+    const option = document.createElement("option");
+    option.value = profile.id;
+    option.textContent = profile.name;
+    select.append(option);
+  }
+  if ([...select.options].some((option) => option.value === previous)) select.value = previous;
+}

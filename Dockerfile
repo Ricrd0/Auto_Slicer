@@ -79,6 +79,7 @@ WORKDIR /opt/auto-slicer
 COPY pyproject.toml README.md ./
 COPY src ./src
 COPY frontend ./frontend
+COPY resources ./resources
 RUN python3 -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir .
 
