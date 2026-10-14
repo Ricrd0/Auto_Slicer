@@ -5,6 +5,7 @@ import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Any
 
 from auto_slicer.browse import gcode_root, model_root
@@ -20,8 +21,16 @@ from auto_slicer.machine_sync import (
     owned_for_printer,
     printers_for_page,
     sync_owned_with_orca_user_profiles,
+    transfer_configured,
     with_idex_mode_gcode,
     with_synced_bed,
+)
+from auto_slicer.transfer import (
+    auto_upload_allowed,
+    probe_transfer,
+    remote_filename_for,
+    upload_file,
+    with_probe_result,
 )
 from auto_slicer.orca_config import active_orca_dir, discover_filaments, discover_orca_printers, load_orca_printers
 from auto_slicer.paths import safe_segment
@@ -270,6 +279,134 @@ class JobRunner:
             return refreshed or job
         return job or {}
 
+    def upload_job_item(self, item_id: int, *, force_probe: bool = True) -> dict[str, Any]:
+        """Upload a finished job item's gcode using the owned printer transfer config."""
+        item = self.store.get_item(item_id)
+        if item is None:
+            raise ValueError("job item not found")
+        if item.get("status") != "done":
+            raise ValueError("only finished items can be uploaded")
+        output_rel = str(item.get("output_path") or "")
+        if not output_rel:
+            raise ValueError("job item has no output path")
+        local = gcode_root(self.store) / output_rel
+        if not local.is_file():
+            raise ValueError(f"gcode file not found: {output_rel}")
+
+        owned = self.owned_snapshot()
+        record = next(
+            (
+                entry
+                for entry in owned
+                if isinstance(entry, dict)
+                and (
+                    entry.get("id") == item.get("printer_id")
+                    or entry.get("cura_id") == item.get("printer_id")
+                    or entry.get("orca_id") == item.get("printer_id")
+                )
+            ),
+            None,
+        )
+        if record is None:
+            # Fall back to matching by display name when printer_id is an engine id.
+            record = next(
+                (
+                    entry
+                    for entry in owned
+                    if isinstance(entry, dict)
+                    and str(entry.get("name") or "") == str(item.get("printer_name") or "")
+                ),
+                None,
+            )
+        transfer = (
+            record.get("transfer")
+            if isinstance(record, dict) and isinstance(record.get("transfer"), dict)
+            else None
+        )
+        if not transfer_configured(transfer):
+            raise ValueError("this printer has no transfer protocol configured")
+
+        if force_probe:
+            probe = probe_transfer(transfer)
+            transfer = with_probe_result(transfer, probe)
+            if isinstance(record, dict):
+                record = {**record, "transfer": transfer}
+                updated = [
+                    record if entry.get("id") == record.get("id") else entry for entry in owned
+                ]
+                self.store.save_owned(updated)
+            if not probe.ok:
+                self.store.update_item(
+                    item_id,
+                    upload_status="skipped",
+                    upload_error=probe.error or "Printer is not reachable",
+                )
+                refreshed = self.store.get_item(item_id)
+                return refreshed or item
+
+        self.store.update_item(item_id, upload_status="uploading", upload_error=None)
+        result = upload_file(
+            transfer, local, remote_name=remote_filename_for(output_rel)
+        )
+        if result.ok:
+            self.store.update_item(item_id, upload_status="uploaded", upload_error=None)
+        else:
+            self.store.update_item(
+                item_id, upload_status="failed", upload_error=result.error
+            )
+        refreshed = self.store.get_item(item_id)
+        return refreshed or item
+
+    def _maybe_auto_upload(
+        self,
+        item_id: int,
+        record: dict[str, Any] | None,
+        local_path: Path,
+        output_rel: str,
+    ) -> None:
+        transfer = (
+            record.get("transfer")
+            if isinstance(record, dict) and isinstance(record.get("transfer"), dict)
+            else None
+        )
+        if not transfer_configured(transfer):
+            return
+        if str(transfer.get("mode") or "manual") != "auto":
+            return
+        # Live probe before auto upload — skip with a clear reason if unreachable.
+        probe = probe_transfer(transfer)
+        updated_transfer = with_probe_result(transfer, probe)
+        if isinstance(record, dict):
+            owned = self.owned_snapshot()
+            record_id = record.get("id")
+            saved = [
+                {**entry, "transfer": updated_transfer}
+                if entry.get("id") == record_id
+                else entry
+                for entry in owned
+            ]
+            self.store.save_owned(saved)
+        if not probe.ok or not auto_upload_allowed(updated_transfer):
+            reason = probe.error or (
+                "Auto upload requires a reachable printer. Test connection first."
+            )
+            self.store.update_item(
+                item_id, upload_status="skipped", upload_error=reason
+            )
+            return
+        self.store.update_item(item_id, upload_status="uploading", upload_error=None)
+        result = upload_file(
+            updated_transfer,
+            local_path,
+            remote_name=remote_filename_for(output_rel),
+        )
+        if result.ok:
+            self.store.update_item(item_id, upload_status="uploaded", upload_error=None)
+        else:
+            self.store.update_item(
+                item_id, upload_status="failed", upload_error=result.error
+            )
+
     def _start(
         self,
         kind: str,
@@ -481,6 +618,7 @@ class JobRunner:
                     filament_meters=filament,
                     error=None,
                 )
+                self._maybe_auto_upload(item_id, record, output, output_rel)
                 return "done"
             except SliceCancelled:
                 self.store.update_item(

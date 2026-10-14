@@ -1218,7 +1218,11 @@ function renderJob(job) {
     const status = item.progress && item.progress !== item.status
       ? `${item.status} — ${item.progress}`
       : item.status;
-    row.innerHTML = `<td>${item.printer_name}</td><td>${item.item_type}: ${item.item_name}</td><td class="job-status">${status}</td><td>${time}</td><td>${filament}</td><td></td>`;
+    const uploadLabel = uploadStatusLabel(item);
+    row.innerHTML = `<td>${item.printer_name}</td><td>${item.item_type}: ${item.item_name}</td><td class="job-status">${status}</td><td>${time}</td><td>${filament}</td><td class="upload-status">${uploadLabel}</td><td></td>`;
+    if (item.upload_error) {
+      row.querySelector(".upload-status").title = item.upload_error;
+    }
     if (item.error) {
       row.title = "Click to show the full error below the table";
       row.addEventListener("click", (event) => {
@@ -1247,6 +1251,26 @@ function renderJob(job) {
         openPreview();
       });
       row.lastElementChild.append(view);
+      if (printerHasTransfer(item.printer_id, item.printer_name)) {
+        const upload = document.createElement("button");
+        upload.type = "button";
+        upload.textContent = item.upload_status === "uploaded" ? "Re-upload" : "Upload";
+        upload.title = item.upload_error || "Upload gcode to this printer";
+        upload.addEventListener("click", async (event) => {
+          event.stopPropagation();
+          upload.disabled = true;
+          try {
+            await api(`/api/jobs/items/${item.id}/upload`, { method: "POST", body: "{}" });
+            const current = await api("/api/jobs/current");
+            renderJob(current);
+          } catch (error) {
+            errorBox.hidden = false;
+            errorBox.textContent = `Upload failed: ${error.message || error}`;
+            upload.disabled = false;
+          }
+        });
+        row.lastElementChild.append(upload);
+      }
       row.addEventListener("click", (event) => {
         if (event.target.closest("a, button")) return;
         openPreview();
@@ -1261,6 +1285,29 @@ function renderJob(job) {
   if (testItem && state.gcodePath !== testItem.output_path) {
     loadGcode(testItem.output_path, jobItemLabel(testItem), bedSizeForPrinter(testItem.printer_id));
   }
+}
+
+function uploadStatusLabel(item) {
+  const status = item.upload_status;
+  if (!status) return "";
+  if (status === "uploaded") return "uploaded";
+  if (status === "uploading") return "uploading…";
+  if (status === "skipped") return "upload skipped";
+  if (status === "failed") return "upload failed";
+  if (status === "pending") return "upload pending";
+  return status;
+}
+
+function printerHasTransfer(printerId, printerName) {
+  const owned = state.owned?.printers || [];
+  const match = owned.find(
+    (item) =>
+      item.id === printerId ||
+      item.cura_id === printerId ||
+      item.orca_id === printerId ||
+      item.name === printerName,
+  );
+  return Boolean(match?.transfer && match.transfer.protocol && match.transfer.protocol !== "none");
 }
 
 function formatDuration(seconds) {
@@ -1621,7 +1668,223 @@ function renderOwnedForm() {
   syncZHopFields(false);
   syncCombingFields(false);
   wireIdexCoupling(form);
+  form.append(renderTransferSection(printer));
+  wireTransferControls(form);
   wireOwnedDirtyTracking(form);
+}
+
+const TRANSFER_FIELDS = [
+  ["transfer_protocol", "Protocol", "select"],
+  ["transfer_mode", "Upload mode", "select"],
+  ["transfer_host", "Host / IP", "text"],
+  ["transfer_port", "Port", "number"],
+  ["transfer_tls", "Use HTTPS (Moonraker)", "checkbox"],
+  ["transfer_api_key", "Moonraker API key", "text"],
+  ["transfer_token", "Snapmaker token", "text"],
+  ["transfer_username", "SFTP username", "text"],
+  ["transfer_password", "SFTP password", "password"],
+  ["transfer_remote_path", "Remote folder", "text"],
+];
+
+function transferDefaults() {
+  return {
+    protocol: "none",
+    mode: "manual",
+    host: "",
+    port: "",
+    api_key: "",
+    token: "",
+    username: "",
+    password: "",
+    remote_path: "",
+    tls: false,
+    reachable: false,
+    last_probe_ok: false,
+    last_probe_error: null,
+  };
+}
+
+function renderTransferSection(printer) {
+  const transfer = { ...transferDefaults(), ...(printer.transfer || {}) };
+  const section = document.createElement("fieldset");
+  section.className = "settings-section";
+  section.id = "transfer-section";
+  const legend = document.createElement("legend");
+  legend.textContent = "Remote upload";
+  section.append(legend);
+  const help = document.createElement("p");
+  help.className = "muted";
+  help.textContent =
+    "Send finished gcode to this printer over the network. Manual upload is available from the Jobs tab. Auto uploads after each successful slice when the printer is reachable.";
+  section.append(help);
+  const grid = document.createElement("div");
+  grid.className = "grid";
+  for (const spec of TRANSFER_FIELDS) {
+    grid.append(transferField(spec, transfer));
+  }
+  const actions = document.createElement("div");
+  actions.className = "toolbar span-2";
+  const testBtn = document.createElement("button");
+  testBtn.type = "button";
+  testBtn.id = "test-transfer";
+  testBtn.textContent = "Test connection";
+  actions.append(testBtn);
+  const status = document.createElement("span");
+  status.id = "transfer-probe-status";
+  status.className = "muted";
+  status.textContent = transferProbeLabel(transfer);
+  actions.append(status);
+  grid.append(actions);
+  const warn = document.createElement("p");
+  warn.id = "transfer-auto-warning";
+  warn.className = "notice span-2";
+  warn.hidden = true;
+  grid.append(warn);
+  section.append(grid);
+  return section;
+}
+
+function transferField([name, label, type], transfer) {
+  const wrap = document.createElement("label");
+  wrap.textContent = label;
+  const key = name.replace(/^transfer_/, "");
+  let input;
+  if (type === "select") {
+    input = document.createElement("select");
+    input.name = name;
+    const options =
+      name === "transfer_protocol"
+        ? state.options?.transfer_protocols || ["none", "moonraker", "snapmaker", "sftp"]
+        : state.options?.transfer_modes || ["manual", "auto"];
+    for (const value of options) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent =
+        name === "transfer_protocol"
+          ? ({ none: "None", moonraker: "Moonraker (Klipper)", snapmaker: "Snapmaker Luban", sftp: "SFTP" }[value] || value)
+          : ({ manual: "Manual", auto: "Auto after slice" }[value] || value);
+      input.append(option);
+    }
+    input.value = transfer[key] || options[0];
+  } else if (type === "checkbox") {
+    input = document.createElement("input");
+    input.type = "checkbox";
+    input.name = name;
+    input.checked = Boolean(transfer[key]);
+  } else {
+    input = document.createElement("input");
+    input.type = type === "password" ? "password" : type === "number" ? "number" : "text";
+    input.name = name;
+    input.value = transfer[key] ?? "";
+    if (type === "number") input.placeholder = "default";
+    if (name === "transfer_remote_path") {
+      input.placeholder = "optional subfolder";
+    }
+  }
+  wrap.append(input);
+  return wrap;
+}
+
+function transferProbeLabel(transfer) {
+  if (!transfer || transfer.protocol === "none") return "No protocol configured.";
+  if (transfer.last_probe_ok && transfer.reachable) return "Last probe: reachable.";
+  if (transfer.last_probe_error) return `Last probe failed: ${transfer.last_probe_error}`;
+  return "Not tested yet — Test connection before enabling Auto.";
+}
+
+function wireTransferControls(form) {
+  const sync = () => syncTransferVisibility(form);
+  for (const name of [
+    "transfer_protocol",
+    "transfer_mode",
+    "transfer_host",
+    "transfer_port",
+    "transfer_api_key",
+    "transfer_token",
+    "transfer_username",
+    "transfer_password",
+    "transfer_tls",
+  ]) {
+    form.elements[name]?.addEventListener("change", sync);
+    form.elements[name]?.addEventListener("input", sync);
+  }
+  sync();
+  const testBtn = form.querySelector("#test-transfer");
+  if (testBtn) {
+    testBtn.addEventListener("click", async () => {
+      const printer = selectedOwned();
+      if (!printer) return;
+      const engine = state.settings?.slicer_engine === "orca" ? "orca" : "cura";
+      const hasScoped = engine === "orca" ? printer.orca_settings : printer.cura_settings;
+      const scope = hasScoped ? engine : "both";
+      testBtn.disabled = true;
+      const status = $("transfer-probe-status");
+      if (status) status.textContent = "Saving…";
+      try {
+        // Persist transfer credentials before probing from the server/container network.
+        await saveOwned(scope);
+        const current = selectedOwned();
+        if (!current) return;
+        if (status) status.textContent = "Testing…";
+        const result = await api(`/api/owned/${encodeURIComponent(current.id)}/transfer/test`, {
+          method: "POST",
+          body: "{}",
+        });
+        if (result.printer) replaceOwnedRecord(result.printer);
+        renderOwnedForm();
+      } catch (error) {
+        if (status) status.textContent = `Test failed: ${error.message || error}`;
+        testBtn.disabled = false;
+      }
+    });
+  }
+}
+
+function syncTransferVisibility(form) {
+  const protocol = form.elements.transfer_protocol?.value || "none";
+  const modeInput = form.elements.transfer_mode;
+  const printer = selectedOwned();
+  const transfer = { ...transferDefaults(), ...(printer?.transfer || {}) };
+  const show = {
+    transfer_host: protocol !== "none",
+    transfer_port: protocol !== "none",
+    transfer_mode: protocol !== "none",
+    transfer_tls: protocol === "moonraker",
+    transfer_api_key: protocol === "moonraker",
+    transfer_token: protocol === "snapmaker",
+    transfer_username: protocol === "sftp",
+    transfer_password: protocol === "sftp",
+    transfer_remote_path: protocol === "moonraker" || protocol === "sftp",
+  };
+  for (const [name, visible] of Object.entries(show)) {
+    const input = form.elements[name];
+    if (!input) continue;
+    input.closest("label").hidden = !visible;
+  }
+  const testBtn = form.querySelector("#test-transfer");
+  if (testBtn) testBtn.closest(".toolbar").hidden = protocol === "none";
+
+  const reachable = Boolean(transfer.last_probe_ok && transfer.reachable);
+  const autoBlocked = protocol !== "none" && !reachable;
+  const autoTip =
+    "Auto upload requires a reachable printer. Use Test connection first. If the printer is offline or unreachable from Auto Slicer (including Docker), Auto stays unavailable.";
+  if (modeInput) {
+    const autoOption = [...modeInput.options].find((option) => option.value === "auto");
+    if (autoOption) {
+      autoOption.disabled = autoBlocked;
+      autoOption.title = autoBlocked ? autoTip : "";
+    }
+    modeInput.title = autoBlocked ? autoTip : "";
+    if (autoBlocked && modeInput.value === "auto") {
+      // Keep the stored value visible but warn; runtime still skips when unreachable.
+    }
+  }
+  const warn = $("transfer-auto-warning");
+  if (warn) {
+    const showWarn = protocol !== "none" && modeInput?.value === "auto" && autoBlocked;
+    warn.hidden = !showWarn;
+    warn.textContent = showWarn ? autoTip : "";
+  }
 }
 
 function shouldShowIdexField(name, settings) {
@@ -2093,12 +2356,34 @@ function ownedNotice(printer, extra = "") {
   return extra ? `${extra} ${base}` : base;
 }
 
+function readTransferFromForm(form, printer) {
+  const prior = { ...transferDefaults(), ...(printer?.transfer || {}) };
+  const portRaw = form.elements.transfer_port?.value;
+  return {
+    protocol: form.elements.transfer_protocol?.value || "none",
+    mode: form.elements.transfer_mode?.value || "manual",
+    host: form.elements.transfer_host?.value || "",
+    port: portRaw === "" || portRaw == null ? null : Number(portRaw),
+    api_key: form.elements.transfer_api_key?.value || "",
+    token: form.elements.transfer_token?.value || "",
+    username: form.elements.transfer_username?.value || "",
+    password: form.elements.transfer_password?.value || "",
+    remote_path: form.elements.transfer_remote_path?.value || "",
+    tls: Boolean(form.elements.transfer_tls?.checked),
+    reachable: Boolean(prior.reachable),
+    last_probe_ok: Boolean(prior.last_probe_ok),
+    last_probe_error: prior.last_probe_error || null,
+  };
+}
+
 function ownedPayload() {
   const printer = selectedOwned();
   const form = $("owned-form");
   const settings = { ...(displayedSettings(printer)) };
   for (const input of form.querySelectorAll("input, select, textarea")) {
-    if (input.name === "orca_id" || input.disabled) continue;
+    if (!input.name || input.name === "orca_id" || input.name.startsWith("transfer_") || input.disabled) {
+      continue;
+    }
     if (input.type === "checkbox") settings[input.name] = input.checked;
     else if (input.type === "number") settings[input.name] = Number(input.value);
     else if (input.name === "filament_id_t1") settings[input.name] = input.value || null;
@@ -2120,6 +2405,7 @@ function ownedPayload() {
     ...printer,
     orca_id: form.elements.orca_id.value || null,
     settings,
+    transfer: readTransferFromForm(form, printer),
   };
 }
 
@@ -2140,7 +2426,7 @@ $("save-owned").addEventListener("click", () => saveOwned("both"));
 
 async function saveOwned(scope) {
   const payload = ownedPayload();
-  if (!payload?.id) return;
+  if (!payload?.id) return false;
   const saveButtons = ["save-owned", "save-cura", "save-orca"].map((id) => $(id));
   for (const button of saveButtons) button.disabled = true;
   try {
@@ -2162,8 +2448,10 @@ async function saveOwned(scope) {
     if (printer) $("owned-notice").textContent = ownedNotice(printer, label);
     state.ownedBaseline = serializeOwnedForm();
     updateOwnedSaveHighlight();
+    return true;
   } catch (error) {
     $("owned-notice").textContent = `Save failed: ${error.message || error}`;
+    throw error;
   } finally {
     for (const button of saveButtons) button.disabled = false;
   }

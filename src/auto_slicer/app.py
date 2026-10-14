@@ -14,6 +14,8 @@ from auto_slicer.orca_config import active_orca_dir, locate_orca, search_filamen
 from auto_slicer.gcode import gcode_info, layer_polylines
 from auto_slicer.machine_sync import (
     GCODE_FLAVORS,
+    TRANSFER_MODES,
+    TRANSFER_PROTOCOLS,
     apply_save_scope,
     machine_for_engine,
     machine_from_cura,
@@ -24,6 +26,7 @@ from auto_slicer.machine_sync import (
     owned_from_orca,
     with_synced_bed,
 )
+from auto_slicer.transfer import probe_transfer, with_probe_result
 from auto_slicer.jobs import JobRunner
 from auto_slicer.paths import DataPaths, safe_relative, safe_segment
 from auto_slicer.placement import Layout
@@ -105,6 +108,8 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
             "gcode_flavors": GCODE_FLAVORS,
             "z_hop_types": Z_HOP_TYPES,
             "z_hop_on_surfaces": Z_HOP_ON_SURFACES,
+            "transfer_protocols": TRANSFER_PROTOCOLS,
+            "transfer_modes": TRANSFER_MODES,
         }
 
     @app.get("/api/settings")
@@ -254,6 +259,28 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
         owned = [item for item in runner.ensure_owned() if item["id"] != printer_id]
         store.save_owned(owned)
         return {"ok": True}
+
+    @app.post("/api/owned/{printer_id}/transfer/test")
+    def test_owned_transfer(printer_id: str) -> dict[str, object]:
+        owned = runner.owned_snapshot()
+        record = next((item for item in owned if item.get("id") == printer_id), None)
+        if record is None:
+            raise HTTPException(status_code=404, detail="owned printer not found")
+        transfer = record.get("transfer") if isinstance(record.get("transfer"), dict) else {}
+        result = probe_transfer(transfer)
+        updated_transfer = with_probe_result(transfer, result)
+        saved = [
+            {**item, "transfer": updated_transfer} if item.get("id") == printer_id else item
+            for item in owned
+        ]
+        store.save_owned(saved)
+        return {
+            "ok": result.ok,
+            "error": result.error,
+            "reachable": result.ok,
+            "transfer": updated_transfer,
+            "printer": next(item for item in saved if item.get("id") == printer_id),
+        }
 
     @app.get("/api/filaments")
     def get_filaments() -> dict[str, object]:
@@ -602,6 +629,13 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
     @app.get("/api/jobs")
     def list_jobs() -> list[dict[str, object]]:
         return store.list_jobs()
+
+    @app.post("/api/jobs/items/{item_id}/upload")
+    def upload_job_item(item_id: int) -> dict[str, object]:
+        try:
+            return runner.upload_job_item(item_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/api/gcode/info")
     def gcode_information(path: str) -> dict[str, object]:

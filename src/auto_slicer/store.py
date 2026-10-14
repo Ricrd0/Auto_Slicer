@@ -43,11 +43,21 @@ class Store:
                 output_path TEXT,
                 time_seconds INTEGER,
                 filament_meters REAL,
-                error TEXT
+                error TEXT,
+                upload_status TEXT,
+                upload_error TEXT
             );
             """
         )
+        self._ensure_column("job_items", "upload_status", "TEXT")
+        self._ensure_column("job_items", "upload_error", "TEXT")
         self._db.commit()
+
+    def _ensure_column(self, table: str, column: str, decl: str) -> None:
+        rows = self._db.execute(f"PRAGMA table_info({table})").fetchall()
+        names = {str(row[1]) for row in rows}
+        if column not in names:
+            self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     def load_settings(self) -> SliceSettings:
         path = self.paths.app_dir / "settings.json"
@@ -155,6 +165,15 @@ class Store:
                 (*fields.values(), item_id),
             )
             self._db.commit()
+
+    def get_item(self, item_id: int) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM job_items WHERE id = ?", (item_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return _item_dict(row)
 
     def cancel_open_items(self, job_id: str) -> int:
         """Mark queued/running items as cancelled. Returns how many rows changed."""
@@ -301,6 +320,26 @@ def _normalize_group(group: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _item_dict(item: sqlite3.Row) -> dict[str, Any]:
+    keys = set(item.keys())
+    return {
+        "id": item["id"],
+        "job_id": item["job_id"] if "job_id" in keys else None,
+        "printer_id": item["printer_id"],
+        "printer_name": item["printer_name"],
+        "item_type": item["item_type"],
+        "item_name": item["item_name"],
+        "status": item["status"],
+        "progress": item["progress"],
+        "output_path": item["output_path"],
+        "time_seconds": item["time_seconds"],
+        "filament_meters": item["filament_meters"],
+        "error": item["error"],
+        "upload_status": item["upload_status"] if "upload_status" in keys else None,
+        "upload_error": item["upload_error"] if "upload_error" in keys else None,
+    }
+
+
 def _job_dict(row: sqlite3.Row, items: list[sqlite3.Row]) -> dict[str, Any]:
     return {
         "id": row["id"],
@@ -310,20 +349,5 @@ def _job_dict(row: sqlite3.Row, items: list[sqlite3.Row]) -> dict[str, Any]:
         "created_at": row["created_at"],
         "finished_at": row["finished_at"],
         "error": row["error"],
-        "items": [
-            {
-                "id": item["id"],
-                "printer_id": item["printer_id"],
-                "printer_name": item["printer_name"],
-                "item_type": item["item_type"],
-                "item_name": item["item_name"],
-                "status": item["status"],
-                "progress": item["progress"],
-                "output_path": item["output_path"],
-                "time_seconds": item["time_seconds"],
-                "filament_meters": item["filament_meters"],
-                "error": item["error"],
-            }
-            for item in items
-        ],
+        "items": [_item_dict(item) for item in items],
     }

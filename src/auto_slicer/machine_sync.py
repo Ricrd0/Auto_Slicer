@@ -25,6 +25,13 @@ from auto_slicer.settings_schema import (
 )
 
 GCODE_FLAVORS: tuple[str, ...] = ("Marlin", "Marlin 2", "RepRap", "Klipper", "UltiGCode")
+TRANSFER_PROTOCOLS: tuple[str, ...] = ("none", "moonraker", "snapmaker", "sftp")
+TRANSFER_MODES: tuple[str, ...] = ("manual", "auto")
+_TRANSFER_DEFAULT_PORTS: dict[str, int] = {
+    "moonraker": 7125,
+    "snapmaker": 8080,
+    "sftp": 22,
+}
 # Snapmaker J1S usable volume (marketing / HMI); Orca's inherited printable_area is 324×200.
 _SNAPMAKER_J1S_BED = (300.0, 200.0, 200.0)
 
@@ -220,6 +227,71 @@ def normalize_machine(data: object, *, printer_name: str | None = None) -> dict[
     return merged
 
 
+def default_transfer() -> dict[str, object]:
+    return {
+        "protocol": "none",
+        "mode": "manual",
+        "host": "",
+        "port": None,
+        "api_key": "",
+        "token": "",
+        "username": "",
+        "password": "",
+        "remote_path": "",
+        "tls": False,
+        "reachable": False,
+        "last_probe_ok": False,
+        "last_probe_error": None,
+    }
+
+
+def normalize_transfer(data: object | None) -> dict[str, object]:
+    """Normalize per-printer remote upload config (not synced to Cura/Orca)."""
+    source = data if isinstance(data, dict) else {}
+    protocol = str(source.get("protocol") or "none").strip().lower()
+    if protocol not in TRANSFER_PROTOCOLS:
+        raise ValueError(f"transfer protocol must be one of {', '.join(TRANSFER_PROTOCOLS)}")
+    mode = str(source.get("mode") or "manual").strip().lower()
+    if mode not in TRANSFER_MODES:
+        raise ValueError(f"transfer mode must be one of {', '.join(TRANSFER_MODES)}")
+    port_raw = source.get("port")
+    port: int | None
+    if port_raw in (None, ""):
+        port = _TRANSFER_DEFAULT_PORTS.get(protocol)
+    else:
+        port = int(port_raw)
+        if port <= 0 or port > 65535:
+            raise ValueError("transfer port must be between 1 and 65535")
+    host = str(source.get("host") or "").strip()
+    if protocol != "none" and not host:
+        raise ValueError("transfer host is required when a protocol is set")
+    if mode == "auto" and protocol == "none":
+        raise ValueError("auto upload requires a transfer protocol")
+    return {
+        "protocol": protocol,
+        "mode": mode if protocol != "none" else "manual",
+        "host": host,
+        "port": port,
+        "api_key": str(source.get("api_key") or ""),
+        "token": str(source.get("token") or ""),
+        "username": str(source.get("username") or ""),
+        "password": str(source.get("password") or ""),
+        "remote_path": str(source.get("remote_path") or "").strip().strip("/"),
+        "tls": bool(source.get("tls")),
+        "reachable": bool(source.get("reachable")),
+        "last_probe_ok": bool(source.get("last_probe_ok")),
+        "last_probe_error": (
+            str(source["last_probe_error"])
+            if source.get("last_probe_error") not in (None, "")
+            else None
+        ),
+    }
+
+
+def transfer_configured(transfer: dict[str, object] | None) -> bool:
+    return bool(transfer) and str(transfer.get("protocol") or "none") != "none"
+
+
 def normalize_owned(data: dict[str, object]) -> dict[str, object]:
     name = str(data.get("name") or "").strip()
     if not name:
@@ -234,6 +306,7 @@ def normalize_owned(data: dict[str, object]) -> dict[str, object]:
         "settings": normalize_machine(data.get("settings"), printer_name=name),
         "cura_settings": _optional_machine(data.get("cura_settings"), printer_name=name),
         "orca_settings": _optional_machine(data.get("orca_settings"), printer_name=name),
+        "transfer": normalize_transfer(data.get("transfer")),
     }
 
 
@@ -397,6 +470,10 @@ def apply_save_scope(
         merged["settings"] = existing["settings"]
         merged["cura_settings"] = existing.get("cura_settings")
         merged["orca_settings"] = existing.get("orca_settings")
+        merged["transfer"] = _merge_transfer_probe(
+            existing.get("transfer") if isinstance(existing.get("transfer"), dict) else None,
+            incoming.get("transfer") if isinstance(incoming.get("transfer"), dict) else None,
+        )
     if scope == "both":
         merged["settings"] = form_settings
         merged["cura_settings"] = None
@@ -406,6 +483,38 @@ def apply_save_scope(
     else:
         merged["orca_settings"] = form_settings
     return normalize_owned(merged)
+
+
+def _merge_transfer_probe(
+    existing: dict[str, object] | None,
+    incoming: dict[str, object] | None,
+) -> dict[str, object]:
+    """Keep last probe result unless connection fields changed."""
+    base = dict(incoming or default_transfer())
+    if existing is None:
+        return base
+    if _transfer_connection_unchanged(existing, base):
+        base["reachable"] = bool(existing.get("reachable"))
+        base["last_probe_ok"] = bool(existing.get("last_probe_ok"))
+        base["last_probe_error"] = existing.get("last_probe_error")
+    else:
+        base["reachable"] = False
+        base["last_probe_ok"] = False
+        base["last_probe_error"] = None
+    return base
+
+
+def _transfer_connection_unchanged(
+    existing: dict[str, object], incoming: dict[str, object]
+) -> bool:
+    for key in ("protocol", "host", "api_key", "token", "username", "password"):
+        if str(existing.get(key) or "") != str(incoming.get(key) or ""):
+            return False
+    if bool(existing.get("tls")) != bool(incoming.get("tls")):
+        return False
+    if existing.get("port") != incoming.get("port"):
+        return False
+    return True
 
 
 def machine_for_engine(record: dict[str, object], engine: str) -> dict[str, object]:
