@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,16 +18,14 @@ class Mount:
 
 
 def mounts_from_env() -> list[Mount]:
-    raw = os.environ.get("AUTO_SLICER_HOST_MOUNTS", "")
-    found: list[Mount] = []
-    for piece in raw.split(";"):
-        if "=" not in piece:
-            continue
-        host, local = piece.split("=", 1)
-        prefix = _host_prefix(host)
-        local_path = Path(local.strip())
-        if prefix and str(local_path):
-            found.append(Mount(prefix, local_path))
+    explicit = _mounts_from_env_string()
+    explicit_hosts = {item.host.lower() for item in explicit}
+    found = [
+        mount
+        for mount in _mounts_from_host_drives() + _mounts_from_bind_paths()
+        if mount.host.lower() not in explicit_hosts
+    ]
+    found.extend(explicit)
     found.sort(key=lambda item: len(item.host), reverse=True)
     return found
 
@@ -217,6 +216,137 @@ def _parent_display(path: Path, roots: list[Path], mounts: list[Mount]) -> str |
 def _root_label(root: Path, mounts: list[Mount]) -> str:
     display = to_display(root, mounts)
     return display or root.name or str(root)
+
+
+def _mounts_from_env_string() -> list[Mount]:
+    raw = os.environ.get("AUTO_SLICER_HOST_MOUNTS", "")
+    found: list[Mount] = []
+    for piece in raw.split(";"):
+        if "=" not in piece:
+            continue
+        host, local = piece.split("=", 1)
+        prefix = _host_prefix(host)
+        local_path = Path(local.strip())
+        if prefix and str(local_path):
+            found.append(Mount(prefix, local_path))
+    return found
+
+
+def _mounts_from_host_drives() -> list[Mount]:
+    raw = os.environ.get("AUTO_SLICER_HOST_DRIVES", "").strip()
+    if not raw:
+        return []
+    root = Path(raw)
+    if not root.is_dir():
+        return []
+    try:
+        children = list(root.iterdir())
+    except OSError:
+        return []
+    found: list[Mount] = []
+    for child in children:
+        name = child.name
+        if len(name) != 1 or name.lower() not in "abcdefghijklmnopqrstuvwxyz":
+            continue
+        try:
+            if not child.is_dir():
+                continue
+        except OSError:
+            continue
+        found.append(Mount(_host_prefix(f"{name.upper()}:\\"), child))
+    found.sort(key=lambda item: item.host.lower())
+    return found
+
+
+def _mounts_from_bind_paths() -> list[Mount]:
+    wanted: set[str] = set()
+    for key in ("AUTO_SLICER_INPUT", "AUTO_SLICER_OUTPUT"):
+        raw = os.environ.get(key, "").strip()
+        if raw:
+            wanted.add(_path_key(Path(raw)))
+    if not wanted:
+        return []
+    found: list[Mount] = []
+    for mount_point, root, source, options in _parse_mountinfo(_mountinfo_text()):
+        if _path_key(Path(mount_point)) not in wanted:
+            continue
+        mount = _windows_bind_mount(mount_point, root, source, options)
+        if mount is not None:
+            found.append(mount)
+    return found
+
+
+def _mountinfo_text() -> str:
+    path = Path("/proc/self/mountinfo")
+    if not path.is_file():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _parse_mountinfo(text: str) -> list[tuple[str, str, str, str]]:
+    records: list[tuple[str, str, str, str]] = []
+    for line in text.splitlines():
+        if " - " not in line:
+            continue
+        left, right = line.split(" - ", 1)
+        left_fields = left.split()
+        right_fields = right.split()
+        if len(left_fields) < 5 or len(right_fields) < 2:
+            continue
+        options = _unescape_mount_field(right_fields[2]) if len(right_fields) > 2 else ""
+        records.append(
+            (
+                _unescape_mount_field(left_fields[4]),
+                _unescape_mount_field(left_fields[3]),
+                _unescape_mount_field(right_fields[1]),
+                options,
+            )
+        )
+    return records
+
+
+def _windows_bind_mount(mount_point: str, root: str, source: str, options: str) -> Mount | None:
+    letter = _drive_letter(source, options)
+    if letter is None:
+        return None
+    local = Path(mount_point)
+    if not str(local):
+        return None
+    return Mount(_host_prefix(_windows_host(letter, root)), local)
+
+
+def _drive_letter(source: str, options: str) -> str | None:
+    matched = re.search(r"path=([A-Za-z]):", options)
+    if matched:
+        return matched.group(1).upper()
+    matched = re.search(r"^([A-Za-z]):", source)
+    if matched:
+        return matched.group(1).upper()
+    return None
+
+
+def _windows_host(letter: str, root: str) -> str:
+    rest = root.replace("/", "\\").strip("\\")
+    if not rest:
+        return f"{letter}:\\"
+    return f"{letter}:\\{rest}"
+
+
+def _unescape_mount_field(value: str) -> str:
+    parts: list[str] = []
+    index = 0
+    while index < len(value):
+        escaped = value[index] == "\\" and index + 3 < len(value) and value[index + 1 : index + 4].isdigit()
+        if escaped:
+            parts.append(chr(int(value[index + 1 : index + 4], 8)))
+            index += 4
+            continue
+        parts.append(value[index])
+        index += 1
+    return "".join(parts)
 
 
 def _host_prefix(value: str) -> str:
