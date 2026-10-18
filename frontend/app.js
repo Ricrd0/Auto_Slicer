@@ -591,6 +591,7 @@ function renderSettings() {
     ["rotation_x", "Shared rotation X", "number", { step: "1", tip: "Degrees applied to every part unless a part has its own rotation." }],
     ["rotation_y", "Shared rotation Y", "number", { step: "1", tip: "Degrees applied to every part unless a part has its own rotation." }],
     ["rotation_z", "Shared rotation Z", "number", { step: "1", tip: "Degrees applied to every part unless a part has its own rotation." }],
+    ["align_longest_to_x", "Align longest edge to X", "checkbox", { tip: "When a part has no saved rotation, rotate it so the longer bed footprint lies along X. Helps bed-slinger printers by keeping long moves on the lighter toolhead axis." }],
     ["layer_height", "Layer height (mm)", "number", { step: "0.01", tip: "Vertical resolution of the print." }],
   ]);
   form.append(general.section);
@@ -1072,7 +1073,8 @@ function renderModels() {
     const fileButton = document.createElement("button");
     fileButton.type = "button";
     fileButton.className = "file-pick";
-    fileButton.textContent = model.path;
+    // Show the file name; keep the relative path in the tooltip when nested.
+    fileButton.textContent = model.name || model.path;
     fileButton.title = model.path;
     fileButton.addEventListener("click", async () => {
       state.selectedModel = model.path;
@@ -1190,12 +1192,42 @@ function jobIsActive(job) {
   return job && (job.status === "queued" || job.status === "running");
 }
 
+function setProgressBar(prefix, percent, detail, { active = false, indeterminate = false } = {}) {
+  const block = $(`${prefix}-progress-block`);
+  const fill = $(`${prefix}-progress-fill`);
+  const label = $(`${prefix}-progress-label`);
+  const detailNode = $(`${prefix}-progress-detail`);
+  const bar = $(`${prefix}-progress-bar`);
+  if (!block || !fill || !label) return;
+  const show = active || percent > 0;
+  block.hidden = !show;
+  const clamped = Math.max(0, Math.min(100, Number(percent) || 0));
+  fill.classList.toggle("indeterminate", Boolean(indeterminate && active));
+  if (!(indeterminate && active)) {
+    fill.style.width = `${clamped}%`;
+  }
+  label.textContent = indeterminate && active && !percent ? "…" : `${clamped}%`;
+  if (detailNode) detailNode.textContent = detail || "";
+  if (bar) bar.setAttribute("aria-valuenow", String(clamped));
+}
+
 function renderJob(job) {
   $("job-status").textContent = job && job.status ? `${job.kind} ${job.status}` : "No job yet";
   const stop = $("stop-batch");
   if (stop) stop.disabled = !jobIsActive(job);
   const start = $("start-batch");
   if (start) start.disabled = jobIsActive(job);
+  const total = job?.total || (job?.items || []).length || 0;
+  const finished = job?.finished ?? (job?.items || []).filter((item) => ["done", "failed", "cancelled"].includes(item.status)).length;
+  const running = job?.running ?? (job?.items || []).filter((item) => item.status === "running").length;
+  const percent = job?.percent ?? (total ? Math.round((100 * finished) / total) : 0);
+  const detail = total
+    ? `${finished}/${total} finished` + (running ? ` · ${running} running` : "") + (job?.done != null ? ` · ${job.done} ok` : "")
+    : "";
+  setProgressBar("job", percent, detail, {
+    active: jobIsActive(job),
+    indeterminate: jobIsActive(job) && finished === 0,
+  });
   const body = $("job-rows");
   body.innerHTML = "";
   const errorBox = $("job-error");
@@ -2605,6 +2637,7 @@ $("input-path").addEventListener("change", () => commitPath("input_dir", $("inpu
 $("output-path").addEventListener("change", () => commitPath("output_dir", $("output-path").value));
 $("browse-input").addEventListener("click", () => openBrowser("input"));
 $("browse-output").addEventListener("click", () => openBrowser("output"));
+$("browse-edit-dir").addEventListener("click", () => openBrowser("edit"));
 $("browser-close").addEventListener("click", () => $("browser").close());
 $("browser-up").addEventListener("click", () => loadBrowser(state.listing?.parent || ""));
 $("browser-go").addEventListener("click", () => loadBrowser($("browser-path").value));
@@ -2619,11 +2652,17 @@ $("browser-files").addEventListener("click", () => applyBrowser(true));
 
 async function openBrowser(purpose) {
   state.browserPurpose = purpose;
-  $("browser-title").textContent = purpose === "input" ? "Choose input folder" : "Choose output directory";
+  $("browser-title").textContent =
+    purpose === "input" ? "Choose input folder"
+      : purpose === "edit" ? "Choose G-code folder"
+        : "Choose output directory";
   $("browser-files").hidden = purpose !== "input";
   $("browser-error").textContent = "";
   $("browser").showModal();
-  const start = purpose === "input" ? $("input-path").value : $("output-path").value;
+  const start =
+    purpose === "input" ? $("input-path").value
+      : purpose === "edit" ? ($("edit-dir").value || $("output-path").value)
+        : $("output-path").value;
   await loadBrowser(start);
 }
 
@@ -2670,6 +2709,11 @@ async function loadBrowser(path) {
 
 async function applyBrowser(filesOnly) {
   const path = $("browser-path").value;
+  if (state.browserPurpose === "edit") {
+    $("edit-dir").value = path;
+    $("browser").close();
+    return;
+  }
   const field = state.browserPurpose === "output" ? "output_dir" : "input_dir";
   const body = { [field]: path };
   if (field === "input_dir") {
@@ -2774,6 +2818,101 @@ function pollJob() {
   }, 1000);
 }
 
+function syncEditModeFields() {
+  const sanitize = $("edit-mode").value === "sanitize";
+  $("edit-replace-fields").hidden = sanitize;
+  $("edit-sanitize-fields").hidden = !sanitize;
+}
+
+function renderEditJob(job) {
+  const active = Boolean(job && (job.status === "queued" || job.status === "running"));
+  $("edit-start").disabled = active;
+  $("edit-stop").disabled = !active && !(job && job.status === "stopped" && job.message === "Stopping…");
+  if (!job || !job.status) {
+    $("edit-status").textContent = "";
+    setProgressBar("edit", 0, "", { active: false });
+    $("edit-errors").hidden = true;
+    return;
+  }
+  $("edit-status").textContent = job.message || `${job.status}`;
+  const detail = job.total
+    ? `${job.processed || 0}/${job.total}` + (job.current_file ? ` · ${job.current_file}` : "")
+      + (job.modified != null ? ` · ${job.modified} modified` : "")
+    : "";
+  setProgressBar("edit", job.percent || 0, detail, {
+    active,
+    indeterminate: active && !(job.processed > 0),
+  });
+  const errorBox = $("edit-errors");
+  if (job.errors?.length) {
+    errorBox.hidden = false;
+    errorBox.textContent = job.errors.join("\n");
+  } else {
+    errorBox.hidden = true;
+    errorBox.textContent = "";
+  }
+}
+
+let editPollTimer = null;
+function pollEditJob() {
+  if (editPollTimer) clearInterval(editPollTimer);
+  editPollTimer = setInterval(async () => {
+    const job = await api("/api/gcode-edit/current");
+    renderEditJob(job);
+    if (!job || !["queued", "running"].includes(job.status)) {
+      clearInterval(editPollTimer);
+      editPollTimer = null;
+      $("edit-stop").disabled = true;
+      $("edit-start").disabled = false;
+    }
+  }, 400);
+}
+
+$("edit-mode").addEventListener("change", syncEditModeFields);
+$("edit-start").addEventListener("click", async () => {
+  const directory = $("edit-dir").value.trim();
+  if (!directory) {
+    $("edit-status").textContent = "Choose a folder of .gcode files first.";
+    return;
+  }
+  const mode = $("edit-mode").value;
+  const payload = {
+    mode,
+    directory,
+    dry_run: $("edit-dry-run").checked,
+    backup: $("edit-backup").checked,
+    workers: Number($("edit-workers").value) || 4,
+    assume_relative_e: $("edit-assume-relative").checked,
+  };
+  if (mode === "replace") {
+    payload.find = $("edit-find").value;
+    payload.replace = $("edit-replace").value;
+    if (!payload.find) {
+      $("edit-status").textContent = "Find text is required.";
+      return;
+    }
+  }
+  try {
+    const job = await api("/api/gcode-edit", { method: "POST", body: JSON.stringify(payload) });
+    renderEditJob(job);
+    pollEditJob();
+  } catch (error) {
+    $("edit-status").textContent = error.message;
+  }
+});
+$("edit-stop").addEventListener("click", async () => {
+  $("edit-stop").disabled = true;
+  try {
+    const job = await api("/api/gcode-edit/stop", { method: "POST" });
+    renderEditJob(job);
+    pollEditJob();
+  } catch (error) {
+    $("edit-status").textContent = error.message;
+    $("edit-stop").disabled = false;
+  }
+});
+syncEditModeFields();
+
 bindPreviewPointer();
 bindGcodePointer();
 $("reset-gcode-view").addEventListener("click", () => {
@@ -2807,13 +2946,17 @@ try {
   state.filamentEdit = early[8].filaments[0]?.id || null;
   renderSettings();
   renderPaths();
+  if (!$("edit-dir").value && state.locations?.output_dir) {
+    $("edit-dir").value = state.locations.output_dir;
+  }
   renderModels();
   renderJob(early[7]);
   renderFilaments();
 
-  const [printers, owned] = await Promise.all([
+  const [printers, owned, editJob] = await Promise.all([
     api("/api/printers"),
     api("/api/owned"),
+    api("/api/gcode-edit/current"),
   ]);
   state.printers = printers;
   state.owned = owned;
@@ -2824,8 +2967,10 @@ try {
   setOrcaCatalogStatus("idle");
   renderPrinters();
   renderOwned();
+  renderEditJob(editJob);
   await showLayout();
   if (early[7].status === "running" || early[7].status === "queued") pollJob();
+  if (editJob?.status === "running" || editJob?.status === "queued") pollEditJob();
 } catch (error) {
   $("engine-status").textContent = `Failed to load: ${error.message || error}`;
 }

@@ -341,6 +341,16 @@ def _item_dict(item: sqlite3.Row) -> dict[str, Any]:
 
 
 def _job_dict(row: sqlite3.Row, items: list[sqlite3.Row]) -> dict[str, Any]:
+    parsed = [_item_dict(item) for item in items]
+    total = len(parsed)
+    done = sum(1 for item in parsed if item["status"] == "done")
+    failed = sum(1 for item in parsed if item["status"] == "failed")
+    cancelled = sum(1 for item in parsed if item["status"] == "cancelled")
+    running = sum(1 for item in parsed if item["status"] == "running")
+    finished = done + failed + cancelled
+    percent = int(round(100 * finished / total)) if total else 0
+    if row["status"] == "done" and total:
+        percent = 100
     return {
         "id": row["id"],
         "kind": row["kind"],
@@ -349,5 +359,12 @@ def _job_dict(row: sqlite3.Row, items: list[sqlite3.Row]) -> dict[str, Any]:
         "created_at": row["created_at"],
         "finished_at": row["finished_at"],
         "error": row["error"],
-        "items": [_item_dict(item) for item in items],
+        "items": parsed,
+        "total": total,
+        "done": done,
+        "failed": failed,
+        "cancelled": cancelled,
+        "running": running,
+        "finished": finished,
+        "percent": percent,
     }

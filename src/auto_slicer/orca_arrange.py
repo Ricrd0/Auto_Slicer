@@ -28,6 +28,7 @@ from auto_slicer.orca_config import (
     write_process_profile,
 )
 from auto_slicer.paths import safe_relative, safe_segment
+from auto_slicer.placement import align_longest_to_x
 from auto_slicer.settings_schema import SliceSettings
 
 
@@ -192,8 +193,9 @@ def _posed_meshes(
         if not source.is_file():
             raise FileNotFoundError(relative)
         pose = poses.get(relative)
-        rotation = _effective_rotation(settings, pose)
         triangles = load_model(source.name, source.read_bytes())
+        scale = _pose_scale(pose)
+        rotation = _resolved_rotation(settings, pose, triangles, scale)
         posed = transform_mesh(
             triangles,
             rotation,
@@ -203,7 +205,7 @@ def _posed_meshes(
             1.0,
             "front_left",
             z=_pose_z(pose),
-            scale=_pose_scale(pose),
+            scale=scale,
         )
         stem = safe_segment(source.stem)
         candidate = f"{stem}.stl"
@@ -251,6 +253,20 @@ def _effective_rotation(
     if pose and isinstance(pose.get("rotation"), list) and len(pose["rotation"]) == 3:
         return (float(pose["rotation"][0]), float(pose["rotation"][1]), float(pose["rotation"][2]))
     return (settings.rotation_x, settings.rotation_y, settings.rotation_z)
+
+
+def _resolved_rotation(
+    settings: SliceSettings,
+    pose: dict[str, Any] | None,
+    triangles: list,
+    scale: float,
+) -> tuple[float, float, float]:
+    base = _effective_rotation(settings, pose)
+    if pose and isinstance(pose.get("rotation"), list) and len(pose["rotation"]) == 3:
+        return base
+    if not settings.align_longest_to_x:
+        return base
+    return align_longest_to_x(triangles, base, scale)
 
 
 def _pose_z(pose: dict[str, Any] | None) -> float:

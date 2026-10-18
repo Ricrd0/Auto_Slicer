@@ -27,6 +27,7 @@ from auto_slicer.machine_sync import (
     with_synced_bed,
 )
 from auto_slicer.transfer import probe_transfer, with_probe_result
+from auto_slicer.edit_jobs import EditJobRunner
 from auto_slicer.jobs import JobRunner
 from auto_slicer.paths import DataPaths, safe_relative, safe_segment
 from auto_slicer.placement import Layout
@@ -61,9 +62,11 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
     resolved.ensure()
     store = Store(resolved)
     runner = JobRunner(store)
+    edit_runner = EditJobRunner(store)
     app = FastAPI(title="Auto Slicer")
     app.state.store = store
     app.state.runner = runner
+    app.state.edit_runner = edit_runner
 
     @app.middleware("http")
     async def revalidate_frontend(request, call_next):
@@ -636,6 +639,21 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
             return runner.upload_job_item(item_id)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/gcode-edit")
+    def start_gcode_edit(payload: dict[str, object]) -> dict[str, object]:
+        try:
+            return edit_runner.start(payload)
+        except (RuntimeError, ValueError, OSError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/gcode-edit/current")
+    def current_gcode_edit() -> dict[str, object]:
+        return edit_runner.current()
+
+    @app.post("/api/gcode-edit/stop")
+    def stop_gcode_edit() -> dict[str, object]:
+        return edit_runner.stop()
 
     @app.get("/api/gcode/info")
     def gcode_information(path: str) -> dict[str, object]:

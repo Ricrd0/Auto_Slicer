@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,11 @@ _LAYER_COUNT_RE = re.compile(r"^;LAYER_COUNT:(\d+)", re.MULTILINE)
 _LAYER_RE = re.compile(r"^;(?:LAYER:(-?\d+)|LAYER_CHANGE)\s*$", re.IGNORECASE)
 _MOVE_RE = re.compile(r"^(G0|G1|G00|G01)\b(.*)$", re.IGNORECASE)
 _AXIS_RE = re.compile(r"([XYZE])(-?[0-9]*\.?[0-9]+)", re.IGNORECASE)
+_E_AXIS_RE = re.compile(r"(\bE)(-?[0-9]*\.?[0-9]+)", re.IGNORECASE)
+# Klipper default: max_extrude_cross_section = 4.0 * nozzle_diameter^2
+_DEFAULT_NOZZLE_MM = 0.4
+_DEFAULT_FILAMENT_MM = 1.75
+_MIN_TRAVEL_MM = 0.05
 
 
 @dataclass(frozen=True)
@@ -30,6 +36,26 @@ class GcodeInfo:
 class Polyline:
     type_name: str
     points: list[list[float]]
+
+
+@dataclass(frozen=True)
+class ExtrusionIssue:
+    """One move that would trip Klipper-style max_extrude_cross_section."""
+
+    line_number: int
+    line: str
+    cross_section: float
+    limit: float
+    travel_mm: float
+    e_mm: float
+
+    @property
+    def message(self) -> str:
+        return (
+            f"line {self.line_number}: extrusion cross-section "
+            f"{self.cross_section:.3f}mm^2 exceeds {self.limit:.3f}mm^2 "
+            f"(E={self.e_mm:g}mm over {self.travel_mm:g}mm XY) — {self.line}"
+        )
 
 
 def parse_gcode_header(text: str) -> tuple[int | None, float | None]:
@@ -63,6 +89,249 @@ def gcode_info(path: Path) -> GcodeInfo:
     else:
         layer_count = sum(1 for line in text.splitlines() if _LAYER_RE.match(line.strip()))
     return GcodeInfo(seconds, filament, layer_count)
+
+
+def klipper_max_extrude_cross_section(nozzle_diameter: float = _DEFAULT_NOZZLE_MM) -> float:
+    """Klipper's default ``max_extrude_cross_section`` for a nozzle diameter."""
+    return 4.0 * float(nozzle_diameter) ** 2
+
+
+def validate_extrusion_cross_section(
+    text: str,
+    *,
+    filament_diameter: float = _DEFAULT_FILAMENT_MM,
+    nozzle_diameter: float = _DEFAULT_NOZZLE_MM,
+    max_cross_section: float | None = None,
+    relative_e: bool | None = None,
+    min_travel_mm: float = _MIN_TRAVEL_MM,
+) -> list[ExtrusionIssue]:
+    """Find XY extrusion moves whose filament cross-section exceeds the limit.
+
+    Mirrors Klipper's check that produced
+    ``Move exceeds maximum extrusion (0.825mm^2 vs 0.640mm^2)``.
+
+    ``relative_e`` overrides M82/M83 detection when set. When neither M-code
+    appears, absolute extrusion is assumed (classic Marlin / Cura default).
+    """
+    limit = (
+        float(max_cross_section)
+        if max_cross_section is not None
+        else klipper_max_extrude_cross_section(nozzle_diameter)
+    )
+    filament_area = math.pi * (float(filament_diameter) / 2.0) ** 2
+    absolute_xy = True
+    e_is_relative = False if relative_e is None else bool(relative_e)
+    x = y = 0.0
+    e_pos = 0.0
+    issues: list[ExtrusionIssue] = []
+
+    for line_number, raw in enumerate(text.splitlines(), start=1):
+        line = raw.split(";", 1)[0].strip()
+        if not line:
+            continue
+        upper = line.upper()
+        if upper.startswith("M83"):
+            e_is_relative = True
+            continue
+        if upper.startswith("M82"):
+            e_is_relative = False
+            continue
+        if upper.startswith("G90"):
+            absolute_xy = True
+            continue
+        if upper.startswith("G91"):
+            absolute_xy = False
+            continue
+        if upper.startswith("G92"):
+            axes = {m.group(1).upper(): float(m.group(2)) for m in _AXIS_RE.finditer(line)}
+            if "E" in axes:
+                e_pos = axes["E"]
+            if "X" in axes:
+                x = axes["X"]
+            if "Y" in axes:
+                y = axes["Y"]
+            continue
+        move = _MOVE_RE.match(line)
+        if not move:
+            continue
+        axes = {m.group(1).upper(): float(m.group(2)) for m in _AXIS_RE.finditer(move.group(2))}
+        prev_x, prev_y, prev_e = x, y, e_pos
+        if absolute_xy:
+            x = axes.get("X", x)
+            y = axes.get("Y", y)
+        else:
+            x += axes.get("X", 0.0)
+            y += axes.get("Y", 0.0)
+        if "E" not in axes:
+            continue
+        if e_is_relative:
+            e_delta = axes["E"]
+            e_pos = prev_e + e_delta
+        else:
+            e_pos = axes["E"]
+            e_delta = e_pos - prev_e
+        if e_delta <= 1e-9:
+            continue
+        travel = math.hypot(x - prev_x, y - prev_y)
+        if travel < min_travel_mm:
+            continue
+        cross_section = e_delta * filament_area / travel
+        if cross_section > limit + 1e-9:
+            issues.append(
+                ExtrusionIssue(
+                    line_number=line_number,
+                    line=line,
+                    cross_section=cross_section,
+                    limit=limit,
+                    travel_mm=travel,
+                    e_mm=e_delta,
+                )
+            )
+    return issues
+
+
+def validate_gcode_file(
+    path: Path,
+    *,
+    filament_diameter: float = _DEFAULT_FILAMENT_MM,
+    nozzle_diameter: float = _DEFAULT_NOZZLE_MM,
+    max_cross_section: float | None = None,
+) -> list[ExtrusionIssue]:
+    """Validate a generated G-code file for Klipper extrusion cross-section limits."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    return validate_extrusion_cross_section(
+        text,
+        filament_diameter=filament_diameter,
+        nozzle_diameter=nozzle_diameter,
+        max_cross_section=max_cross_section,
+    )
+
+
+def sanitize_relative_extrusion_script(
+    text: str,
+    *,
+    assume_relative_e: bool = False,
+    filament_diameter: float = _DEFAULT_FILAMENT_MM,
+    nozzle_diameter: float = _DEFAULT_NOZZLE_MM,
+    max_cross_section: float | None = None,
+    min_travel_mm: float = _MIN_TRAVEL_MM,
+) -> str:
+    """Rewrite start/end scripts that over-extrude under relative E (M83).
+
+    Printer profiles often keep Marlin absolute primes (``E15`` then ``E30``)
+    after switching to ``M83``. Under relative extrusion that second pass
+    doubles the filament and trips Klipper's ``max_extrude_cross_section``.
+
+    Fixes:
+    - When the next prime E is ~2× the previous (absolute accumulation), use
+      the previous amount instead.
+    - Otherwise clamp E so the move stays under the Klipper limit.
+    """
+    if not (text or "").strip():
+        return text or ""
+    limit = (
+        float(max_cross_section)
+        if max_cross_section is not None
+        else klipper_max_extrude_cross_section(nozzle_diameter)
+    )
+    filament_area = math.pi * (float(filament_diameter) / 2.0) ** 2
+    absolute_xy = True
+    e_is_relative = bool(assume_relative_e)
+    x = y = 0.0
+    last_prime_e: float | None = None
+    out: list[str] = []
+
+    for raw in text.splitlines():
+        code, sep, comment = raw.partition(";")
+        line = code.strip()
+        if not line:
+            out.append(raw)
+            continue
+        upper = line.upper()
+        if upper.startswith("M83"):
+            e_is_relative = True
+            out.append(raw)
+            continue
+        if upper.startswith("M82"):
+            e_is_relative = False
+            last_prime_e = None
+            out.append(raw)
+            continue
+        if upper.startswith("G90"):
+            absolute_xy = True
+            out.append(raw)
+            continue
+        if upper.startswith("G91"):
+            absolute_xy = False
+            out.append(raw)
+            continue
+        if upper.startswith("G92"):
+            axes = {m.group(1).upper(): float(m.group(2)) for m in _AXIS_RE.finditer(line)}
+            if "E" in axes:
+                last_prime_e = None
+            if "X" in axes:
+                x = axes["X"]
+            if "Y" in axes:
+                y = axes["Y"]
+            out.append(raw)
+            continue
+        move = _MOVE_RE.match(line)
+        if not move:
+            out.append(raw)
+            continue
+        axes = {m.group(1).upper(): float(m.group(2)) for m in _AXIS_RE.finditer(move.group(2))}
+        prev_x, prev_y = x, y
+        if absolute_xy:
+            x = axes.get("X", x)
+            y = axes.get("Y", y)
+        else:
+            x += axes.get("X", 0.0)
+            y += axes.get("Y", 0.0)
+        if "E" not in axes or not e_is_relative:
+            out.append(raw)
+            continue
+        e_delta = axes["E"]
+        if e_delta <= 1e-9:
+            out.append(raw)
+            continue
+        travel = math.hypot(x - prev_x, y - prev_y)
+        if travel < min_travel_mm:
+            last_prime_e = None
+            out.append(raw)
+            continue
+
+        fixed = e_delta
+        if last_prime_e is not None and last_prime_e > 0:
+            # Classic absolute second pass written into a relative script.
+            if abs(e_delta - 2.0 * last_prime_e) <= max(0.05, 0.02 * e_delta):
+                fixed = last_prime_e
+        max_e = limit * travel / filament_area
+        if fixed > max_e + 1e-9:
+            fixed = max_e * 0.95
+        if abs(fixed - e_delta) > 1e-9:
+            body = _replace_e_value(line, fixed)
+            if sep:
+                note = comment.lstrip()
+                out.append(f"{body} ; {note}" if note else f"{body} ;")
+            else:
+                out.append(body)
+            last_prime_e = fixed
+        else:
+            out.append(raw)
+            last_prime_e = e_delta
+    result = "\n".join(out)
+    if text.endswith("\n"):
+        result += "\n"
+    return result
+
+
+def _replace_e_value(code: str, new_e: float) -> str:
+    """Replace the first E axis value in a G-code command (comments already stripped)."""
+    if float(new_e).is_integer():
+        rendered = str(int(new_e))
+    else:
+        rendered = format(float(new_e), "g")
+    return _E_AXIS_RE.sub(rf"\g<1>{rendered}", code, count=1)
 
 
 def layer_polylines(path: Path, index: int, include_travel: bool) -> list[Polyline]:

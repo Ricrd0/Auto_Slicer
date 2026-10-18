@@ -40,9 +40,7 @@ def browse(path: str, extra_roots: list[Path]) -> dict[str, object]:
             for root in roots
         ]
         return {"path": "", "parent": None, "entries": entries}
-    local = _allowed(to_local(path, mounts), roots)
-    if not local.is_dir():
-        raise ValueError("folder was not found")
+    local = resolve_allowed_dir(path, extra_roots)
     parent = _parent_display(local, roots, mounts)
     entries: list[dict[str, str]] = []
     try:
@@ -62,6 +60,16 @@ def browse(path: str, extra_roots: list[Path]) -> dict[str, object]:
             entries.append({"name": child.name, "path": to_display(child, mounts), "kind": "file"})
     entries.sort(key=lambda item: (item["kind"] != "dir", item["name"].lower()))
     return {"path": to_display(local, mounts), "parent": parent, "entries": entries}
+
+
+def resolve_allowed_dir(path: str, extra_roots: list[Path]) -> Path:
+    """Resolve a UI display path to a local directory under allowed roots."""
+    mounts = mounts_from_env()
+    roots = _roots(mounts, extra_roots)
+    local = _allowed(to_local(path, mounts), roots)
+    if not local.is_dir():
+        raise ValueError("folder was not found")
+    return local
 
 
 def model_root(store: Store) -> Path:

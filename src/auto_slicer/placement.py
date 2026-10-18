@@ -100,6 +100,28 @@ def footprint_of(
     )
 
 
+def align_longest_to_x(
+    triangles: list[Triangle],
+    rotation: tuple[float, float, float],
+    scale: float = 1.0,
+    *,
+    epsilon: float = 1e-3,
+) -> tuple[float, float, float]:
+    """Rotate about Z so the longer XY footprint edge lies along X.
+
+    Bed-slinger printers move the bed (and everything on it) in Y. Keeping the
+    long faces along X prefers lighter toolhead motion for those strokes.
+    Near-square footprints are left unchanged.
+    """
+    rx, ry, rz = (float(rotation[0]), float(rotation[1]), float(rotation[2]))
+    low_x, low_y, _low_z, high_x, high_y, _high_z = rotated_bounds(triangles, (rx, ry, rz), scale)
+    width = high_x - low_x
+    depth = high_y - low_y
+    if depth > width + epsilon:
+        return (rx, ry, rz + 90.0)
+    return (rx, ry, rz)
+
+
 def center_position(
     part: Footprint,
     bed_width: float,

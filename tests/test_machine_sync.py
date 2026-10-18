@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 from auto_slicer.cura_config import PrinterProfile
+from auto_slicer.gcode import validate_extrusion_cross_section
 from auto_slicer.machine_sync import (
     apply_filament,
     apply_save_scope,
@@ -114,6 +115,21 @@ def test_purge_line_helper_is_idempotent() -> None:
     twice = with_purge_line(once, bed_depth=200)
     assert once == twice
     assert with_purge_line("", bed_depth=200) == ""
+
+
+def test_purge_line_is_safe_for_relative_extrusion() -> None:
+    """Second pass must not use absolute-style E24 (0.825 mm^2 under M83)."""
+    block = with_purge_line("G28\n", bed_depth=220)
+    assert "E24" not in block
+    assert block.count("G92 E0") >= 3
+    assert validate_extrusion_cross_section("M83\n" + block) == []
+    # Also safe when appended after a typical Klipper start that already primed.
+    primed = (
+        "G90\nM83\nG28\nG1 Z0.3 F300\nG92 E0\nG1 E8 F300\n"
+        "G1 X60 Y10 E6 F900\nG92 E0\n"
+    )
+    combined = with_purge_line(primed, bed_depth=220)
+    assert validate_extrusion_cross_section(combined) == []
 
 
 def test_print_speeds_are_written_for_both_engines() -> None:

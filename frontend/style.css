@@ -126,6 +126,45 @@ a { color: var(--link); }
   overflow: auto;
   font-size: 0.88rem;
 }
+
+.progress-block {
+  margin: 0.35rem 0 0.9rem;
+  padding: 0.65rem 0.75rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.progress-block[hidden] { display: none !important; }
+.progress-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+  align-items: baseline;
+  margin-bottom: 0.45rem;
+  font-size: 0.92rem;
+}
+.progress-track {
+  height: 0.7rem;
+  background: var(--field);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.progress-fill {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, #b8642e, var(--accent));
+  transition: width 0.25s ease;
+}
+.progress-fill.indeterminate {
+  width: 35% !important;
+  animation: progress-slide 1.2s ease-in-out infinite;
+}
+@keyframes progress-slide {
+  0% { transform: translateX(-120%); }
+  100% { transform: translateX(320%); }
+}
+
 .settings-section { margin: 0 0 0.9rem; }
 .settings-section > .grid { margin-top: 0.35rem; }
 .settings-hint { margin: 0.15rem 0 0; color: var(--muted); font-size: 0.85rem; }
@@ -205,9 +244,10 @@ a { color: var(--link); }
 }
 .model-matrix thead .col-include { z-index: 5; background: #2a241f; }
 .model-matrix .col-file {
-  min-width: 10rem;
-  max-width: 18rem;
-  width: 18rem;
+  min-width: 12rem;
+  /* Grow with the filename; sticky column scrolls with the matrix when needed. */
+  width: max-content;
+  max-width: none;
   position: sticky;
   left: 3.6rem;
   z-index: 3;
@@ -222,16 +262,17 @@ a { color: var(--link); }
 .model-matrix tbody tr.selected .col-include,
 .model-matrix tbody tr.selected .col-file { background: var(--selected); }
 .model-matrix .file-pick {
+  display: block;
   border: 0;
   background: transparent;
   color: inherit;
   padding: 0.15rem 0;
-  width: 100%;
-  max-width: 17.5rem;
+  width: max-content;
+  max-width: none;
+  min-width: 100%;
   text-align: left;
   white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  overflow: visible;
 }
 .model-matrix .col-group {
   width: 3rem;

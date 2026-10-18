@@ -6,6 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from auto_slicer.cura_config import PrinterProfile
+from auto_slicer.gcode import sanitize_relative_extrusion_script
 from auto_slicer.orca_config import (
     active_orca_dir,
     area_is_center_zero,
@@ -1120,8 +1121,19 @@ def apply_shared_slice_to_machine(
     if not merged.get("combing_override"):
         merged = dict(merged)
         merged["retraction_combing"] = settings.retraction_combing
+    merged = dict(merged)
+    nozzle = float(merged.get("nozzle_diameter") or 0.4)
+    # Klipper / Orca relative-E profiles often still carry Marlin absolute primes.
+    assume_relative = str(merged.get("gcode_flavor") or "").lower() == "klipper"
+    for key in ("cura_start_gcode", "orca_start_gcode"):
+        script = str(merged.get(key) or "")
+        if script.strip():
+            merged[key] = sanitize_relative_extrusion_script(
+                script,
+                assume_relative_e=assume_relative,
+                nozzle_diameter=nozzle,
+            )
     if settings.purge_line:
-        merged = dict(merged)
         depth = float(merged.get("bed_depth") or 200.0)
         for key in ("cura_start_gcode", "orca_start_gcode"):
             merged[key] = with_purge_line(str(merged.get(key) or ""), bed_depth=depth)
@@ -1133,19 +1145,28 @@ def with_purge_line(script: str, *, bed_depth: float = 200.0) -> str:
 
     Empty scripts are left alone so the slicer profile's own start G-code
     (which often already primes) is preserved.
+
+    Extrusion uses equal relative-safe E amounts with ``G92 E0`` between
+    passes. Absolute-style ``E12`` then ``E24`` over-extrudes under Orca/Klipper
+    relative extrusion (M83) and trips ``max_extrude_cross_section``.
     """
     text = script or ""
     if not text.strip() or _PURGE_MARK in text:
         return text
     y_end = min(80.0, max(30.0, float(bed_depth) - 20.0))
+    travel = abs(y_end - 10.0)
+    # Stay under Klipper's default max_extrude_cross_section (0.64 mm^2 for a
+    # 0.4 mm nozzle) with 1.75 mm filament: E/mm ≈ 0.2 → ~0.48 mm^2.
+    e_amount = _num(min(12.0, max(2.0, travel * 0.15)))
     block = (
         f"{_PURGE_MARK}\n"
         "G92 E0\n"
         "G1 Z0.3 F3000\n"
         "G1 X5 Y10 F6000\n"
-        f"G1 Y{_num(y_end)} E12 F1500\n"
+        f"G1 Y{_num(y_end)} E{e_amount} F1500\n"
+        "G92 E0\n"
         "G1 X5.4 F6000\n"
-        "G1 Y10 E24 F1500\n"
+        f"G1 Y10 E{e_amount} F1500\n"
         "G92 E0\n"
         "G1 Z2 F3000\n"
         ";AUTO_SLICER_PURGE_LINE_END\n"

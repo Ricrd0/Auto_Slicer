@@ -87,6 +87,9 @@ class SliceSettings:
     rotation_x: float = 0.0
     rotation_y: float = 0.0
     rotation_z: float = 0.0
+    # When no per-part rotation is saved, rotate about Z so the longer XY edge
+    # lies along X (lighter motion on bed-slinger printers).
+    align_longest_to_x: bool = True
     layer_height: float = 0.2
     ironing_enabled: bool = True
     ironing_only_highest_layer: bool = True

@@ -1,5 +1,7 @@
 from auto_slicer.meshio import Triangle
-from auto_slicer.placement import footprint_of, place_group, place_single
+from auto_slicer.placement import align_longest_to_x, footprint_of, place_group, place_single
+from auto_slicer.settings_schema import SliceSettings
+from auto_slicer.slicing import resolved_rotation
 
 
 def _part(name: str, width: float, depth: float, height: float = 2) -> tuple[str, list[Triangle]]:
@@ -86,3 +88,24 @@ def test_group_is_recentered_for_each_bed_size() -> None:
     assert large_items["a.stl"].min_x == 125.0
     assert small_items["b.stl"].min_x - small_items["a.stl"].min_x == 30.0
     assert large_items["b.stl"].min_x - large_items["a.stl"].min_x == 30.0
+
+
+def test_align_longest_to_x_rotates_when_depth_exceeds_width() -> None:
+    _name, triangles = _part("beam.stl", width=10, depth=40, height=5)
+    assert align_longest_to_x(triangles, (0, 0, 0)) == (0.0, 0.0, 90.0)
+    # Already longer along X — unchanged.
+    _name2, wide = _part("plank.stl", width=40, depth=10, height=5)
+    assert align_longest_to_x(wide, (0, 0, 0)) == (0.0, 0.0, 0.0)
+    after = footprint_of("beam.stl", triangles, align_longest_to_x(triangles, (0, 0, 0)))
+    assert after.width >= after.depth
+
+
+def test_resolved_rotation_skips_auto_when_pose_sets_rotation() -> None:
+    _name, triangles = _part("beam.stl", width=10, depth=40, height=5)
+    settings = SliceSettings(align_longest_to_x=True)
+    auto = resolved_rotation(settings, None, triangles)
+    assert auto == (0.0, 0.0, 90.0)
+    kept = resolved_rotation(settings, {"rotation": [0, 0, 15]}, triangles)
+    assert kept == (0.0, 0.0, 15.0)
+    disabled = resolved_rotation(SliceSettings(align_longest_to_x=False), None, triangles)
+    assert disabled == (0.0, 0.0, 0.0)

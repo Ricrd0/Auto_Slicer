@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Auto Slicer</title>
-  <link rel="stylesheet" href="/style.css?v=14">
+  <link rel="stylesheet" href="/style.css?v=16">
   <script type="importmap">
     { "imports": { "three": "/vendor/three.module.js" } }
   </script>
@@ -21,6 +21,7 @@
       <button type="button" data-tab="printer-settings">Printer settings</button>
       <button type="button" data-tab="models">Models</button>
       <button type="button" data-tab="jobs">Jobs</button>
+      <button type="button" data-tab="gcode-edit">G-code edit</button>
     </nav>
   </header>
   <main>
@@ -136,6 +137,15 @@
         <button type="button" id="stop-batch" disabled>Stop</button>
         <span id="job-status" class="muted"></span>
       </div>
+      <div class="progress-block" id="job-progress-block" hidden>
+        <div class="progress-meta">
+          <span id="job-progress-label">0%</span>
+          <span id="job-progress-detail" class="muted"></span>
+        </div>
+        <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="job-progress-bar">
+          <div class="progress-fill" id="job-progress-fill"></div>
+        </div>
+      </div>
       <div class="table-wrap">
         <table>
           <thead>
@@ -155,6 +165,56 @@
       </div>
       <canvas id="gcode-view"></canvas>
     </section>
+    <section id="gcode-edit" class="panel">
+      <h2>Batch G-code edit</h2>
+      <p class="muted">Find and replace text across generated <code>.gcode</code> files, or apply the relative-extrusion prime fix to existing output. Dry-run first when unsure.</p>
+      <div class="path-stack">
+        <label>Folder
+          <span class="path-field">
+            <input id="edit-dir" spellcheck="false" placeholder="Folder of .gcode files (searched recursively)">
+            <button type="button" id="browse-edit-dir">Browse</button>
+          </span>
+        </label>
+      </div>
+      <div class="toolbar">
+        <label>Mode
+          <select id="edit-mode">
+            <option value="replace">Find and replace</option>
+            <option value="sanitize">Fix relative extrusion primes</option>
+          </select>
+        </label>
+        <label class="inline"><input id="edit-dry-run" type="checkbox" checked> Dry run</label>
+        <label class="inline"><input id="edit-backup" type="checkbox"> Backup (.bak)</label>
+        <label>Workers <input id="edit-workers" type="number" min="1" max="32" value="4" style="width:4.5rem"></label>
+      </div>
+      <div id="edit-replace-fields" class="grid">
+        <label class="span-2">Find
+          <textarea id="edit-find" spellcheck="false" placeholder="Exact text to find (case-sensitive)"></textarea>
+        </label>
+        <label class="span-2">Replace with
+          <textarea id="edit-replace" spellcheck="false" placeholder="Replacement text, or path to a .gcode file whose contents will be used"></textarea>
+        </label>
+      </div>
+      <div id="edit-sanitize-fields" class="toolbar" hidden>
+        <label class="inline"><input id="edit-assume-relative" type="checkbox"> Force relative extrusion (even without M83)</label>
+        <span class="muted">Rewrites absolute-style primes like E15 then E30 under relative extrusion so they stay under Klipper’s max extrusion limit.</span>
+      </div>
+      <div class="toolbar">
+        <button type="button" id="edit-start" class="primary">Run</button>
+        <button type="button" id="edit-stop" disabled>Stop</button>
+        <span id="edit-status" class="muted"></span>
+      </div>
+      <div class="progress-block" id="edit-progress-block" hidden>
+        <div class="progress-meta">
+          <span id="edit-progress-label">0%</span>
+          <span id="edit-progress-detail" class="muted"></span>
+        </div>
+        <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="edit-progress-bar">
+          <div class="progress-fill" id="edit-progress-fill"></div>
+        </div>
+      </div>
+      <pre id="edit-errors" class="job-error" hidden></pre>
+    </section>
   </main>
   <dialog id="browser">
     <div class="toolbar">
@@ -173,6 +233,6 @@
       <button type="button" id="browser-files">Slice selected files</button>
     </div>
   </dialog>
-  <script type="module" src="/app.js?v=25"></script>
+  <script type="module" src="/app.js?v=27"></script>
 </body>
 </html>

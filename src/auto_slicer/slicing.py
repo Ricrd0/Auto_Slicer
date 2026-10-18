@@ -8,7 +8,7 @@ from typing import Any
 
 from auto_slicer.cura_config import PrinterProfile, active_config_dir
 from auto_slicer.engine import EngineError, build_slice_command, locate_cura, run_slice
-from auto_slicer.gcode import parse_gcode_header
+from auto_slicer.gcode import parse_gcode_header, validate_gcode_file
 from auto_slicer.machine_sync import (
     cura_extruder_temperature_overrides,
     cura_machine_overrides,
@@ -17,7 +17,7 @@ from auto_slicer.machine_sync import (
     orca_process_extras,
     patch_orca_machine,
 )
-from auto_slicer.meshio import load_model, transform_mesh, write_stl
+from auto_slicer.meshio import Triangle, load_model, transform_mesh, write_stl
 from auto_slicer.orca_arrange import arrange_group, layout_from_arranged_3mf
 from auto_slicer.orca_config import (
     active_orca_dir,
@@ -37,6 +37,7 @@ from auto_slicer.placement import (
     Footprint,
     Layout,
     PlacementZone,
+    align_longest_to_x,
     footprint_of,
     idex_zone,
     place_group,
@@ -90,6 +91,22 @@ def effective_rotation(settings: SliceSettings, pose: dict[str, Any] | None) -> 
     return (settings.rotation_x, settings.rotation_y, settings.rotation_z)
 
 
+def resolved_rotation(
+    settings: SliceSettings,
+    pose: dict[str, Any] | None,
+    triangles: list[Triangle],
+    scale: float = 1.0,
+) -> tuple[float, float, float]:
+    """Shared / per-part rotation, optionally auto-aligned longest-edge-to-X."""
+    base = effective_rotation(settings, pose)
+    # A saved part rotation is an explicit choice — do not re-twist it.
+    if pose and isinstance(pose.get("rotation"), list) and len(pose["rotation"]) == 3:
+        return base
+    if not settings.align_longest_to_x:
+        return base
+    return align_longest_to_x(triangles, base, scale)
+
+
 def saved_position(pose: dict[str, Any] | None) -> tuple[float, float] | None:
     if not pose or not isinstance(pose.get("position"), list) or len(pose["position"]) < 2:
         return None
@@ -125,7 +142,7 @@ def layout_for_model(
     machine: dict[str, object] | None = None,
 ) -> Layout:
     part = replace(
-        _footprint(input_dir, relative, effective_rotation(settings, pose), pose_scale(pose)),
+        _oriented_footprint(input_dir, relative, settings, pose),
         z=pose_z(pose),
     )
     return place_single(
@@ -149,20 +166,10 @@ def layout_for_group(
 ) -> Layout:
     parts = []
     for relative in files:
-        base = effective_rotation(settings, poses.get(relative))
+        pose = poses.get(relative)
         arrange_z = _manual_rotation_z(manual_layout, relative)
-        rotation = (base[0], base[1], base[2] + arrange_z)
-        parts.append(
-            replace(
-                _footprint(
-                    input_dir,
-                    relative,
-                    rotation,
-                    pose_scale(poses.get(relative)),
-                ),
-                z=pose_z(poses.get(relative)),
-            )
-        )
+        part = _oriented_footprint(input_dir, relative, settings, pose, extra_z=arrange_z)
+        parts.append(replace(part, z=pose_z(pose)))
     manual = None
     if isinstance(manual_layout, dict):
         manual = {name: (float(pos["x"]), float(pos["y"])) for name, pos in manual_layout.items()}
@@ -502,7 +509,7 @@ def run_prepared_slice(
         if output.is_file():
             output.unlink()
         raise EngineError(tail or f"CuraEngine exited with status {code}")
-    return _header_from_file(output)
+    return _header_from_file(output, machine=machine)
 
 
 def _apply_cura_t1_temps(command: list[str], machine: dict[str, object]) -> list[str]:
@@ -620,14 +627,32 @@ def _run_orca(
     extract_plate_gcode(archive, output)
     if not output.is_file() or output.stat().st_size == 0:
         raise EngineError(tail or "OrcaSlicer did not produce gcode")
-    return _header_from_file(output)
+    return _header_from_file(output, machine=machine)
 
 
 def _printer_with_machine_path(printer: PrinterProfile, path: Path) -> PrinterProfile:
     return replace(printer, definition_path=str(path))
 
 
-def _header_from_file(path: Path) -> tuple[int | None, float | None]:
+def _header_from_file(
+    path: Path,
+    *,
+    machine: dict[str, object] | None = None,
+) -> tuple[int | None, float | None]:
+    nozzle = 0.4
+    if machine is not None and machine.get("nozzle_diameter") not in (None, ""):
+        nozzle = float(machine["nozzle_diameter"])
+    issues = validate_gcode_file(path, nozzle_diameter=nozzle)
+    if issues:
+        detail = issues[0].message
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise EngineError(
+            "Generated G-code failed extrusion validation "
+            f"(would exceed Klipper max_extrude_cross_section): {detail}"
+        )
     text = path.read_text(encoding="utf-8", errors="replace")
     return parse_gcode_header(text[:8000] + "\n" + text[-8000:])
 
@@ -638,6 +663,21 @@ def _footprint(
     path = _model_path(input_dir, relative)
     triangles = load_model(path.name, path.read_bytes())
     return footprint_of(relative, triangles, rotation, scale)
+
+
+def _oriented_footprint(
+    input_dir: Path,
+    relative: str,
+    settings: SliceSettings,
+    pose: dict[str, Any] | None,
+    *,
+    extra_z: float = 0.0,
+) -> Footprint:
+    path = _model_path(input_dir, relative)
+    triangles = load_model(path.name, path.read_bytes())
+    scale = pose_scale(pose)
+    rx, ry, rz = resolved_rotation(settings, pose, triangles, scale)
+    return footprint_of(relative, triangles, (rx, ry, rz + float(extra_z)), scale)
 
 
 def _model_path(input_dir: Path, relative: str) -> Path:
