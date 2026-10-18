@@ -157,6 +157,13 @@ def test_print_speeds_are_written_for_both_engines() -> None:
     assert process["initial_layer_speed"] == "18"
     assert process["travel_speed"] == "160"
     assert process["wall_loops"] == "3"
+    assert "ironing_flow" not in process
+    raised = dict(machine)
+    raised["ironing_flow_override"] = True
+    raised["ironing_flow"] = 20
+    assert orca_process_extras(raised)["ironing_flow"] == "20%"
+    assert orca_filament_overrides(raised)["filament_ironing_flow"] == ["20%"]
+    assert dict(cura_machine_overrides(raised))["ironing_flow"] == "20"
 
 
 def test_printers_page_includes_owned_without_engine_link() -> None:

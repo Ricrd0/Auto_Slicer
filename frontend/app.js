@@ -1550,6 +1550,10 @@ const OWNED_SECTIONS = [
     ["z_hop_type", "Z hop type", "select"],
     ["z_hop_on_surfaces", "On surfaces", "select"],
   ]],
+  ["Ironing", [
+    ["ironing_flow_override", "Use this printer's ironing flow", "checkbox"],
+    ["ironing_flow", "Ironing flow (%)", "number", "1"],
+  ]],
 ];
 
 function selectedOwned() {
@@ -1607,6 +1611,7 @@ function renderOwnedForm() {
   const notice = $("owned-notice");
   form.innerHTML = "";
   renderFilaments();
+  syncProfileModeControls(printer);
   if (!printer) {
     notice.textContent = "No printers are available yet.";
     return;
@@ -1699,10 +1704,15 @@ function renderOwnedForm() {
   }
   syncZHopFields(false);
   syncCombingFields(false);
+  if (form.elements.ironing_flow_override) {
+    form.elements.ironing_flow_override.addEventListener("change", () => syncIroningFlowFields());
+  }
+  syncIroningFlowFields();
   wireIdexCoupling(form);
   form.append(renderTransferSection(printer));
   wireTransferControls(form);
   wireOwnedDirtyTracking(form);
+  syncProfileModeControls(printer);
 }
 
 const TRANSFER_FIELDS = [
@@ -2094,6 +2104,12 @@ function ownedField([name, label, type, step], settings) {
     hint.textContent = "Enabling this turns on Apply IDEX offset and suffixes gcode with _copy or _mirror.";
     wrap.append(hint);
   }
+  if (name === "ironing_flow_override") {
+    const hint = document.createElement("span");
+    hint.className = "muted";
+    hint.textContent = "Orca print profiles usually iron at 10% flow. Cura on these printers is often 20%. Turn this on to set ironing flow for this printer in both slicers.";
+    wrap.append(hint);
+  }
   return wrap;
 }
 
@@ -2105,6 +2121,12 @@ function selectOptionsForField(name) {
   }
   if (name === "gcode_flavor") return state.options.gcode_flavors || ["Marlin"];
   return [];
+}
+
+function syncIroningFlowFields() {
+  const form = $("owned-form");
+  if (!form?.elements?.ironing_flow_override || !form.elements.ironing_flow) return;
+  form.elements.ironing_flow.disabled = !form.elements.ironing_flow_override.checked;
 }
 
 function syncTemperatureFields(fromToggle) {
@@ -2384,7 +2406,16 @@ function displayedSettings(printer) {
 function ownedNotice(printer, extra = "") {
   const cura = printer.cura_settings ? "Cura uses its own saved settings" : "Cura uses the shared settings";
   const orca = printer.orca_settings ? "Orca uses its own saved settings" : "Orca uses the shared settings";
-  const base = `Cura profile: ${printer.cura_name || "none"} · Orca profile: ${printer.orca_name || "none"}. ${cura}. ${orca}.`;
+  const mode = printer.profile_mode || "master";
+  const profile =
+    mode === "author"
+      ? "This machine publishes the master profile."
+      : mode === "local"
+        ? "This machine uses its local profile."
+        : printer.master_available === false
+          ? "No master profile was found, so the local setup is used."
+          : "This machine follows the shared master profile. Machine settings stay read-only; connection details can still be saved.";
+  const base = `${profile} Cura profile: ${printer.cura_name || "none"} · Orca profile: ${printer.orca_name || "none"}. ${cura}. ${orca}.`;
   return extra ? `${extra} ${base}` : base;
 }
 
@@ -2438,7 +2469,31 @@ function ownedPayload() {
     orca_id: form.elements.orca_id.value || null,
     settings,
     transfer: readTransferFromForm(form, printer),
+    profile_mode: $("profile-mode")?.value || printer?.profile_mode || "master",
   };
+}
+
+function syncProfileModeControls(printer) {
+  const select = $("profile-mode");
+  if (!select) return;
+  const mode = printer?.profile_mode || "master";
+  if (document.activeElement !== select) select.value = mode;
+  select.disabled = !printer;
+  const locked = !printer || mode === "master";
+  for (const id of ["save-cura", "save-orca", "pull-cura", "pull-orca"]) {
+    const button = $(id);
+    if (button) button.disabled = locked;
+  }
+  const saveBoth = $("save-owned");
+  if (saveBoth) saveBoth.disabled = !printer;
+  const form = $("owned-form");
+  if (form && locked) {
+    for (const input of form.querySelectorAll("input, select, textarea, button")) {
+      const transfer = (input.name && input.name.startsWith("transfer_")) || input.id === "test-transfer";
+      if (transfer) continue;
+      input.disabled = true;
+    }
+  }
 }
 
 $("owned-printer").addEventListener("change", () => {
@@ -2455,6 +2510,12 @@ $("owned-printer").addEventListener("change", () => {
 $("save-cura").addEventListener("click", () => saveOwned("cura"));
 $("save-orca").addEventListener("click", () => saveOwned("orca"));
 $("save-owned").addEventListener("click", () => saveOwned("both"));
+$("profile-mode").addEventListener("change", () => {
+  saveOwned("both").catch(() => {
+    const printer = selectedOwned();
+    if ($("profile-mode") && printer) $("profile-mode").value = printer.profile_mode || "master";
+  });
+});
 
 async function saveOwned(scope) {
   const payload = ownedPayload();
@@ -2485,7 +2546,7 @@ async function saveOwned(scope) {
     $("owned-notice").textContent = `Save failed: ${error.message || error}`;
     throw error;
   } finally {
-    for (const button of saveButtons) button.disabled = false;
+    syncProfileModeControls(selectedOwned());
   }
 }
 

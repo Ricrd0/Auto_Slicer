@@ -7,6 +7,7 @@ from pathlib import Path
 
 from auto_slicer.cura_config import PrinterProfile
 from auto_slicer.gcode import sanitize_relative_extrusion_script
+from auto_slicer.master_profiles import apply_master_profile, profile_mode_of
 from auto_slicer.orca_config import (
     active_orca_dir,
     area_is_center_zero,
@@ -58,6 +59,7 @@ _NUMBER_FIELDS = (
     "bed_temperature",
     "bed_temperature_initial",
     "idex_offset_x",
+    "ironing_flow",
 )
 _PURGE_MARK = ";AUTO_SLICER_PURGE_LINE"
 _SPEED_FIELDS = (
@@ -145,6 +147,8 @@ def default_machine() -> dict[str, object]:
         "idex_mirror_mode": False,
         "filament_id_t1": None,
         "extruder_count": 1,
+        "ironing_flow_override": False,
+        "ironing_flow": 20.0,
     }
 
 
@@ -162,6 +166,8 @@ def normalize_machine(data: object, *, printer_name: str | None = None) -> dict[
         merged["z_hop_override"] = _is_true(raw["z_hop_override"])
     if "combing_override" in raw:
         merged["combing_override"] = _is_true(raw["combing_override"])
+    if "ironing_flow_override" in raw:
+        merged["ironing_flow_override"] = _is_true(raw["ironing_flow_override"])
     if "z_hop_enabled" in raw:
         merged["z_hop_enabled"] = _is_true(raw["z_hop_enabled"])
     elif "z_hop" in raw and raw["z_hop"] not in (None, ""):
@@ -220,6 +226,8 @@ def normalize_machine(data: object, *, printer_name: str | None = None) -> dict[
     ):
         if float(merged[key]) < 0:
             raise ValueError(f"{key} cannot be negative")
+    if not 0 <= float(merged["ironing_flow"]) <= 100:
+        raise ValueError("ironing_flow must be between 0 and 100")
     if merged["idex_offset_enabled"] and float(merged["idex_offset_x"]) == 0:
         raise ValueError("idex_offset_x must be non-zero when Apply IDEX offset is enabled")
     if merged["idex_copy_mode"] or merged["idex_mirror_mode"]:
@@ -308,6 +316,7 @@ def normalize_owned(data: dict[str, object]) -> dict[str, object]:
         "cura_settings": _optional_machine(data.get("cura_settings"), printer_name=name),
         "orca_settings": _optional_machine(data.get("orca_settings"), printer_name=name),
         "transfer": normalize_transfer(data.get("transfer")),
+        "profile_mode": profile_mode_of(data),
     }
 
 
@@ -483,6 +492,10 @@ def apply_save_scope(
         merged["cura_settings"] = form_settings
     else:
         merged["orca_settings"] = form_settings
+    merged["profile_mode"] = profile_mode_of(
+        incoming if isinstance(incoming, dict) else None,
+        default=profile_mode_of(existing if isinstance(existing, dict) else None),
+    )
     return normalize_owned(merged)
 
 
@@ -516,6 +529,20 @@ def _transfer_connection_unchanged(
     if existing.get("port") != incoming.get("port"):
         return False
     return True
+
+
+def present_owned(record: dict[str, object]) -> dict[str, object]:
+    """Owned record as the form and slicer should see it.
+
+    Master mode overlays the shared setup, then machine fields are filled in
+    so newer settings still have a value when the shared file predates them.
+    """
+    viewed = apply_master_profile(record)
+    name = str(viewed.get("name") or "")
+    viewed["settings"] = normalize_machine(viewed.get("settings"), printer_name=name)
+    viewed["cura_settings"] = _optional_machine(viewed.get("cura_settings"), printer_name=name)
+    viewed["orca_settings"] = _optional_machine(viewed.get("orca_settings"), printer_name=name)
+    return viewed
 
 
 def machine_for_engine(record: dict[str, object], engine: str) -> dict[str, object]:
@@ -980,6 +1007,8 @@ def cura_machine_overrides(machine: dict[str, object]) -> list[tuple[str, str]]:
         ("material_bed_temperature_layer_0", bed_initial),
         ("default_material_bed_temperature", bed),
     ]
+    if machine.get("ironing_flow_override"):
+        values.append(("ironing_flow", _num(float(machine["ironing_flow"]))))
     if machine["cura_start_gcode"]:
         values.append(("machine_start_gcode", str(machine["cura_start_gcode"])))
     if machine["cura_end_gcode"]:
@@ -1080,6 +1109,8 @@ def orca_process_extras(machine: dict[str, object], settings: SliceSettings | No
         "initial_layer_speed": _num(float(machine["initial_layer_speed"])),
         "initial_layer_infill_speed": _num(float(machine["initial_layer_speed"])),
     }
+    if machine.get("ironing_flow_override"):
+        extras["ironing_flow"] = f"{_num(float(machine['ironing_flow']))}%"
     if settings is not None:
         extras["wall_loops"] = str(
             wall_loops_for(settings.wall_thickness, float(machine["nozzle_diameter"]))
@@ -1245,6 +1276,8 @@ def orca_filament_overrides(machine: dict[str, object], *, tool: int = 0) -> dic
         "filament_z_hop_types": [str(machine["z_hop_type"])],
         "filament_retract_lift_enforce": [str(machine.get("z_hop_on_surfaces") or "Top Only")],
     }
+    if machine.get("ironing_flow_override"):
+        values["filament_ironing_flow"] = [f"{_num(float(machine['ironing_flow']))}%"]
     for plate in ("cool_plate", "eng_plate", "hot_plate", "textured_plate"):
         values[f"{plate}_temp"] = [bed]
         values[f"{plate}_temp_initial_layer"] = [bed_initial]

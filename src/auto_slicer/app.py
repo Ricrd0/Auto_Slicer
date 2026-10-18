@@ -23,8 +23,15 @@ from auto_slicer.machine_sync import (
     normalize_filament,
     normalize_owned,
     owned_for_printer,
+    present_owned,
     owned_from_orca,
     with_synced_bed,
+)
+from auto_slicer.master_profiles import (
+    form_was_showing_master,
+    load_master_profiles,
+    profile_mode_of,
+    publish_master_profile,
 )
 from auto_slicer.transfer import probe_transfer, with_probe_result
 from auto_slicer.edit_jobs import EditJobRunner
@@ -159,8 +166,11 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
                 # Dropdown can list linked profiles without a full catalog warm.
                 orca = runner.resolve_owned_orca(owned)
         return {
-            "printers": _with_profile_names(owned, cura, orca),
+            "printers": [
+                present_owned(item) for item in _with_profile_names(owned, cura, orca)
+            ],
             "orca_profiles": [{"id": printer.id, "name": printer.name} for printer in orca],
+            "master_count": len(load_master_profiles()),
         }
 
     @app.put("/api/owned")
@@ -185,8 +195,19 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
             )
         try:
             record = apply_save_scope(existing, incoming, str(payload.get("scope") or "both"))
+            mode = profile_mode_of(payload if "profile_mode" in payload else record)
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        record["profile_mode"] = mode
+        if form_was_showing_master(existing, mode):
+            # The form was showing the shared overlay. Keep this machine's
+            # stored setup (including when switching to local or author).
+            record["settings"] = existing.get("settings")
+            record["cura_settings"] = existing.get("cura_settings")
+            record["orca_settings"] = existing.get("orca_settings")
+            record = normalize_owned(record)
+        if mode == "author":
+            publish_master_profile(record)
         if existing is not None and existing["id"] != record["id"]:
             record["id"] = existing["id"]
         replaced = False
@@ -200,7 +221,7 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
         if not replaced:
             updated.append(record)
         store.save_owned(updated)
-        return record
+        return present_owned(record)
 
     @app.post("/api/owned")
     def post_owned(payload: dict[str, object]) -> dict[str, object]:
@@ -558,6 +579,8 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
         kind = str(payload.get("kind", "model"))
         owned = runner.ensure_owned()
         record = owned_for_printer(printer, owned)
+        if record is not None:
+            record = present_owned(record)
         machine = machine_for_engine(record, printer.engine) if record else None
         if machine is not None:
             printer = with_synced_bed(printer, machine)

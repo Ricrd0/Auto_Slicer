@@ -11,6 +11,7 @@ from typing import Any
 from auto_slicer.browse import gcode_root, model_root
 from auto_slicer.cura_config import PrinterProfile, discover_printers
 from auto_slicer.engine import EngineError, SliceCancelled, locate_cura, terminate_slice_process
+from auto_slicer.master_profiles import adopt_master_printers
 from auto_slicer.machine_sync import (
     apply_filaments,
     apply_shared_slice_to_machine,
@@ -19,6 +20,7 @@ from auto_slicer.machine_sync import (
     merge_owned,
     normalize_owned,
     owned_for_printer,
+    present_owned,
     printers_for_page,
     sync_owned_with_orca_user_profiles,
     transfer_configured,
@@ -80,13 +82,13 @@ class JobRunner:
             elif engine_name == "orca":
                 cura = self.cached_discovered("cura") or []
                 owned = self.ensure_owned(cura_printers=cura, orca_printers=found)
-            return printers_for_page(found, owned, engine=engine_name, catalog=True)
+            return printers_for_page(found, self._presented(owned), engine=engine_name, catalog=True)
 
         if refresh and engine_name != "orca":
             found = self._discovered("cura")
             orca = self.cached_discovered("orca") or []
             owned = self.ensure_owned(cura_printers=found, orca_printers=orca)
-            return printers_for_page(found, owned, engine=engine_name, catalog=False)
+            return printers_for_page(found, self._presented(owned), engine=engine_name, catalog=False)
 
         # Default Printers page: owned machines only. Orca links resolve from disk
         # by id — never kick off a full catalog scan here.
@@ -98,11 +100,22 @@ class JobRunner:
             found = self.cached_discovered("cura") or []
             if not found:
                 self.warm_catalog("cura")
-        return printers_for_page(found, owned, engine=engine_name, catalog=False)
+        return printers_for_page(found, self._presented(owned), engine=engine_name, catalog=False)
+
+    def _presented(self, owned: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        presented: list[dict[str, Any]] = []
+        for item in owned:
+            try:
+                presented.append(present_owned(item))
+            except (TypeError, ValueError):
+                presented.append(item)
+        return presented
 
     def owned_snapshot(self) -> list[dict[str, Any]]:
         """Normalize owned printers without discovering engine catalogs."""
-        existing = self.store.load_owned()
+        existing = adopt_master_printers(
+            [item for item in self.store.load_owned() if isinstance(item, dict)]
+        )
         snapshot: list[dict[str, Any]] = []
         for item in existing:
             if not isinstance(item, dict):
@@ -125,6 +138,7 @@ class JobRunner:
             orca = orca_printers if orca_printers is not None else self._discovered("orca")
             merged = merge_owned(existing, cura, orca)
             merged = sync_owned_with_orca_user_profiles(merged, active_orca_dir())
+            merged = [normalize_owned(item) for item in adopt_master_printers(merged)]
         except (TypeError, ValueError):
             # Keep the UI usable if one owned record has a stale/unknown field.
             return existing
@@ -457,6 +471,8 @@ class JobRunner:
             for printer in printers:
                 printer_dir = names[printer.id]
                 record = owned_for_printer(printer, owned)
+                if record is not None:
+                    record = present_owned(record)
                 machine = machine_for_engine(record, printer.engine) if record else None
                 modes = idex_output_modes(machine)
                 for mode in modes:
@@ -548,6 +564,8 @@ class JobRunner:
             prepared = None
             try:
                 record = owned_for_printer(printer, owned)
+                if record is not None:
+                    record = present_owned(record)
                 machine = machine_for_engine(record, printer.engine) if record else None
                 active_printer = printer
                 if machine is not None:

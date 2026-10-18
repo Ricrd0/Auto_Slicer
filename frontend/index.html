@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Auto Slicer</title>
-  <link rel="stylesheet" href="/style.css?v=16">
+  <link rel="stylesheet" href="/style.css?v=17">
   <script type="importmap">
     { "imports": { "three": "/vendor/three.module.js" } }
   </script>
@@ -70,9 +70,16 @@
         </details>
       </div>
       <h3>Machine</h3>
-      <p class="muted">Save for both engines stores one setup for Cura and Orca. Save for Cura or Save for Orca keeps the other engine on its current setup. Start and end scripts stay with the engine they came from until you copy them across.</p>
+      <p class="muted">Save for both engines stores one setup for Cura and Orca. Save for Cura or Save for Orca keeps the other engine on its current setup. Start and end scripts stay with the engine they came from until you copy them across. Profile chooses whether this machine follows the shared master, keeps its own copy, or publishes its copy as the master for every other machine.</p>
       <div class="toolbar">
         <label>Printer<select id="owned-printer"></select></label>
+        <label>Profile
+          <select id="profile-mode">
+            <option value="master">Use master profile</option>
+            <option value="local">Use local profile</option>
+            <option value="author">Use as master</option>
+          </select>
+        </label>
         <button type="button" id="pull-cura">Load from Cura</button>
         <button type="button" id="pull-orca">Load from Orca</button>
         <button type="button" id="save-cura">Save for Cura</button>
@@ -233,6 +240,6 @@
       <button type="button" id="browser-files">Slice selected files</button>
     </div>
   </dialog>
-  <script type="module" src="/app.js?v=27"></script>
+  <script type="module" src="/app.js?v=30"></script>
 </body>
 </html>
