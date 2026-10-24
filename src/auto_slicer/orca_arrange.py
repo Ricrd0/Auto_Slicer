@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import io
 import json
+import re
 import tempfile
+import xml.etree.ElementTree as ET
+import zipfile
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -20,15 +24,18 @@ from auto_slicer.meshio import (
 from auto_slicer.orca_config import (
     active_orca_dir,
     apply_user_orca_machine_override,
+    area_is_center_zero,
     build_orca_arrange_command,
+    compatible_printer_names,
     generic_pla,
     locate_orca,
     process_inherits_for_machine,
     write_filament_profile,
     write_process_profile,
+    _bed_size,
 )
 from auto_slicer.paths import safe_relative, safe_segment
-from auto_slicer.placement import align_longest_to_x
+from auto_slicer.placement import Footprint, align_longest_to_x, place_group
 from auto_slicer.settings_schema import SliceSettings
 
 
@@ -71,8 +78,7 @@ def arrange_group(
             loaded = json.loads(machine_path.read_text(encoding="utf-8"))
             if isinstance(loaded, dict):
                 source = apply_user_orca_machine_override(loaded, config_dir)
-        machine_name = str(source.get("name") or printer.name)
-        compatible = [machine_name] if machine_name else None
+        compatible = compatible_printer_names(source, printer.name)
         write_process_profile(
             process_path,
             settings,
@@ -85,7 +91,7 @@ def arrange_group(
             machine_json = patch_orca_machine(
                 machine_json, machine, use_idex_zone=use_idex_zone
             )
-        machine_json["printer_structure"] = "i3" if settings.orca_arrange_align_y else "undefine"
+        machine_json["printer_structure"] = "i3" if arrange_uses_y_alignment(settings) else "undefine"
         patched = root / "machine.json"
         patched.write_text(json.dumps(machine_json, indent=2), encoding="utf-8")
         arranged_printer = replace(printer, definition_path=str(patched))
@@ -136,10 +142,132 @@ def arrange_group(
         code, tail = run_slice(command, library_path)
         if code != 0 or not export_path.is_file() or export_path.stat().st_size == 0:
             raise EngineError(tail or f"OrcaSlicer arrange exited with status {code}")
+        payload = export_path.read_bytes()
+        if _occupied_plate_count(payload) > 1:
+            raise EngineError("arranged parts did not fit on one plate")
+        bed = _bed_size(machine_json.get("printable_area"))
+        if bed is not None:
+            payload = _space_arranged_project(
+                payload,
+                settings,
+                bed[0],
+                bed[1],
+                area_is_center_zero(machine_json.get("printable_area")),
+            )
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(export_path.read_bytes())
-        layout = layout_from_arranged_3mf(destination.read_bytes(), files)
+        destination.write_bytes(payload)
+        layout = layout_from_arranged_3mf(payload, files)
     return layout, destination
+
+
+def arrange_uses_y_alignment(settings: SliceSettings) -> bool:
+    """Whether a group should turn each part so its long edge follows Y.
+
+    Unchecked, the long edge stays on X. Checked, Orca's arrange yaws it onto Y.
+    """
+    return settings.orca_arrange_align_y
+
+
+def _space_arranged_project(
+    data: bytes,
+    settings: SliceSettings,
+    bed_width: float,
+    bed_depth: float,
+    center_zero: bool,
+) -> bytes:
+    """Move arranged parts so the gap between them is the group offset.
+
+    Orca's CLI packs parts until they touch. Pack the arranged footprints with
+    the offset and shift the build-item transforms so the saved project matches.
+    """
+    if bed_width <= 0 or bed_depth <= 0:
+        return data
+    parts = read_3mf_placements(data)
+    footprints: list[Footprint] = []
+    current: dict[str, tuple[float, float]] = {}
+    for name, mesh, _transform in parts:
+        low, high = bounds(mesh)
+        current[name] = (low[0], low[1])
+        footprints.append(
+            Footprint(
+                file=name,
+                width=max(high[0] - low[0], 0.0),
+                depth=max(high[1] - low[1], 0.0),
+                height=max(high[2] - low[2], 0.0),
+                rotation=(0.0, 0.0, 0.0),
+            )
+        )
+    layout = place_group(
+        footprints,
+        bed_width,
+        bed_depth,
+        max((part.height for part in footprints), default=1.0),
+        settings.orca_arrange_spacing,
+        None,
+    )
+    if layout.error or not layout.items:
+        return data
+    targets = {item.file: (item.min_x, item.min_y) for item in layout.items}
+    if center_zero:
+        targets = {
+            name: (x - bed_width / 2.0, y - bed_depth / 2.0) for name, (x, y) in targets.items()
+        }
+    deltas: list[tuple[float, float]] = []
+    for name, _mesh, _transform in parts:
+        target = targets.get(name)
+        origin = current.get(name)
+        if target is None or origin is None:
+            return data
+        deltas.append((target[0] - origin[0], target[1] - origin[1]))
+    if all(abs(dx) < 1e-6 and abs(dy) < 1e-6 for dx, dy in deltas):
+        return data
+    return _shift_build_items(data, deltas)
+
+
+def _shift_build_items(data: bytes, deltas: list[tuple[float, float]]) -> bytes:
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        model_names = [name for name in archive.namelist() if name.lower().endswith("3d/3dmodel.model")]
+        if not model_names:
+            return data
+        model_name = model_names[0]
+        model = archive.read(model_name).decode("utf-8")
+        entries = [(name, archive.read(name)) for name in archive.namelist() if name != model_name]
+    pattern = re.compile(r'(<item\b[^>]*\btransform=")([^"]+)(")')
+    matches = list(pattern.finditer(model))
+    if len(matches) != len(deltas):
+        return data
+    pieces: list[str] = []
+    cursor = 0
+    for match, (dx, dy) in zip(matches, deltas, strict=True):
+        numbers = [float(part) for part in match.group(2).split()]
+        if len(numbers) != 12:
+            return data
+        numbers[9] += dx
+        numbers[10] += dy
+        pieces.append(model[cursor : match.start()])
+        pieces.append(match.group(1))
+        pieces.append(" ".join(format(number, ".6f") for number in numbers))
+        pieces.append(match.group(3))
+        cursor = match.end()
+    pieces.append(model[cursor:])
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name, content in entries:
+            archive.writestr(name, content)
+        archive.writestr(model_name, "".join(pieces).encode("utf-8"))
+    return buffer.getvalue()
+
+
+def _occupied_plate_count(data: bytes) -> int:
+    """How many plates in an Orca project actually hold a model."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            if "Metadata/model_settings.config" not in archive.namelist():
+                return 1
+            root = ET.fromstring(archive.read("Metadata/model_settings.config"))
+    except (zipfile.BadZipFile, ET.ParseError, KeyError):
+        return 1
+    return sum(1 for plate in root.findall("plate") if plate.find("model_instance") is not None)
 
 
 def arranged_3mf_path(input_dir: Path, files: list[str], group_name: str) -> Path:
@@ -153,7 +281,11 @@ def layout_from_arranged_3mf(data: bytes, files: list[str]) -> dict[str, dict[st
     Align-to-Y / allow-rotations can spin parts on the plate. Positions alone
     are not enough — slicing must reuse that Z rotation or footprints disagree
     with the saved project and look like overlaps / out-of-bed errors.
+    A project that spilled onto a second plate is rejected so the caller can
+    arrange again on a larger bed instead of keeping the plate-to-plate gap.
     """
+    if _occupied_plate_count(data) > 1:
+        raise EngineError("arranged parts did not fit on one plate")
     parts = read_3mf_placements(data)
     by_base = {Path(relative).name.lower(): relative for relative in files}
     positions: dict[str, dict[str, float]] = {}
@@ -221,13 +353,21 @@ def _posed_meshes(
 
 
 def _arrange_process_extras(settings: SliceSettings) -> dict[str, str]:
-    """Map Spacing onto Orca Auto inflation (brim width when distance is Auto)."""
-    if settings.orca_arrange_spacing > 0:
-        return {
-            "brim_type": "outer_only",
-            "brim_width": _number(settings.orca_arrange_spacing),
-        }
-    return {}
+    """Turn the group offset into the gap Orca leaves between arranged parts.
+
+    Orca's arrange has no distance flag. With none set, it inflates each part by
+    the process brim, so the gap is twice that brim (an 8 mm brim leaves 16 mm).
+    Half the requested offset is written as an arrange-only brim, which makes
+    the gap equal the offset. Skirt and raft are cleared so they do not add
+    space. Slicing still uses the real adhesion settings.
+    """
+    half = settings.orca_arrange_spacing / 2.0
+    return {
+        "brim_type": "outer_only" if half > 0 else "no_brim",
+        "brim_width": _number(half),
+        "skirt_loops": "0",
+        "raft_layers": "0",
+    }
 
 
 def _group_directory(input_dir: Path, files: list[str]) -> Path:
@@ -264,7 +404,7 @@ def _resolved_rotation(
     base = _effective_rotation(settings, pose)
     if pose and isinstance(pose.get("rotation"), list) and len(pose["rotation"]) == 3:
         return base
-    if not settings.align_longest_to_x:
+    if settings.orca_arrange_align_y:
         return base
     return align_longest_to_x(triangles, base, scale)
 

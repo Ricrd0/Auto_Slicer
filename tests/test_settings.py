@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from auto_slicer.settings_schema import SliceSettings, cura_setting_overrides
+from auto_slicer.settings_schema import SliceSettings, cura_setting_overrides, pack_gap
 
 
 def test_defaults_match_the_shop_profile() -> None:
@@ -38,10 +38,12 @@ def test_defaults_match_the_shop_profile() -> None:
     assert settings.z_hop_on_surfaces == "Top Only"
     assert settings.adhesion_type == "brim"
     assert settings.support_enable is False
-    assert settings.orca_arrange_spacing == 0
+    assert settings.orca_arrange_spacing == 5
+    assert pack_gap(settings) == 5
+    assert pack_gap(SliceSettings(orca_arrange_spacing=2.5)) == 2.5
     assert settings.orca_arrange_rotate is False
     assert settings.orca_arrange_multicolor is True
-    assert settings.orca_arrange_align_y is True
+    assert settings.orca_arrange_align_y is False
 
 
 def test_shared_overrides_put_combing_seam_and_infill_last_among_themselves() -> None:

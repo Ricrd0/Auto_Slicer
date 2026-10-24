@@ -23,6 +23,7 @@ from auto_slicer.orca_config import (
     active_orca_dir,
     apply_user_orca_machine_override,
     build_orca_command,
+    compatible_printer_names,
     extract_plate_gcode,
     generic_pla,
     locate_orca,
@@ -168,7 +169,16 @@ def layout_for_group(
     for relative in files:
         pose = poses.get(relative)
         arrange_z = _manual_rotation_z(manual_layout, relative)
-        part = _oriented_footprint(input_dir, relative, settings, pose, extra_z=arrange_z)
+        # The group checkbox picks the long-edge axis. Unchecked forces X.
+        # Checked leaves the arranged yaw (Orca's align-to-Y) as the only turn,
+        # so a second longest-edge-to-X pass does not spin the part back.
+        if settings.slicer_engine == "orca":
+            auto_align: bool | None = not settings.orca_arrange_align_y
+        else:
+            auto_align = None
+        part = _oriented_footprint(
+            input_dir, relative, settings, pose, extra_z=arrange_z, auto_align=auto_align
+        )
         parts.append(replace(part, z=pose_z(pose)))
     manual = None
     if isinstance(manual_layout, dict):
@@ -420,6 +430,16 @@ def prepare_slice(
     return PreparedSlice(layout, meshes, temporary)
 
 
+def _output_parts(printer_dir: str, folder: str, test: bool) -> list[str]:
+    parts = [safe_segment(printer_dir)]
+    name = folder.strip()
+    if name:
+        parts.append(safe_segment(name))
+    if test:
+        parts.append("_test")
+    return parts
+
+
 def output_model_path(
     printer_dir: str,
     folder: str,
@@ -430,9 +450,7 @@ def output_model_path(
     model = safe_relative(relative)
     stem = model.stem + (f"_{mode_suffix}" if mode_suffix else "")
     gcode_name = model.with_name(f"{safe_segment(stem)}.gcode")
-    parts = [safe_segment(printer_dir), safe_segment(folder)]
-    if test:
-        parts.append("_test")
+    parts = _output_parts(printer_dir, folder, test)
     return Path(*parts, *gcode_name.parts)
 
 
@@ -443,9 +461,7 @@ def output_group_path(
     test: bool,
     mode_suffix: str | None = None,
 ) -> Path:
-    parts = [safe_segment(printer_dir), safe_segment(folder)]
-    if test:
-        parts.append("_test")
+    parts = _output_parts(printer_dir, folder, test)
     parts.append("groups")
     name = safe_segment(group_name) + (f"_{mode_suffix}" if mode_suffix else "")
     return Path(*parts, f"{name}.gcode")
@@ -556,8 +572,7 @@ def _run_orca(
         loaded = json.loads(machine_path.read_text(encoding="utf-8"))
         if isinstance(loaded, dict):
             source = apply_user_orca_machine_override(loaded, config_dir)
-    machine_name = str(source.get("name") or printer.name)
-    compatible = [machine_name] if machine_name else None
+    compatible = compatible_printer_names(source, printer.name)
     write_process_profile(
         process_path,
         settings,
@@ -672,11 +687,21 @@ def _oriented_footprint(
     pose: dict[str, Any] | None,
     *,
     extra_z: float = 0.0,
+    auto_align: bool | None = None,
 ) -> Footprint:
     path = _model_path(input_dir, relative)
     triangles = load_model(path.name, path.read_bytes())
     scale = pose_scale(pose)
-    rx, ry, rz = resolved_rotation(settings, pose, triangles, scale)
+    if auto_align is False:
+        rx, ry, rz = effective_rotation(settings, pose)
+    elif auto_align is True:
+        base = effective_rotation(settings, pose)
+        if pose and isinstance(pose.get("rotation"), list) and len(pose["rotation"]) == 3:
+            rx, ry, rz = base
+        else:
+            rx, ry, rz = align_longest_to_x(triangles, base, scale)
+    else:
+        rx, ry, rz = resolved_rotation(settings, pose, triangles, scale)
     return footprint_of(relative, triangles, (rx, ry, rz + float(extra_z)), scale)
 
 

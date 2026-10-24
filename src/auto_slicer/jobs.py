@@ -153,14 +153,28 @@ class JobRunner:
             self._catalog_state = {"cura": "idle", "orca": "idle"}
             self._catalog_error = {"cura": None, "orca": None}
 
-    def cached_discovered(self, engine_name: str) -> list[PrinterProfile] | None:
-        with self._printer_lock:
+    def cached_discovered(
+        self, engine_name: str, *, wait: bool = True
+    ) -> list[PrinterProfile] | None:
+        """Return a fresh catalog cache entry.
+
+        ``wait=False`` is for page loads. A catalog warm holds this lock only
+        around its bookkeeping, but a stuck holder must not freeze the printers
+        the user already owns.
+        """
+        if wait:
+            self._printer_lock.acquire()
+        elif not self._printer_lock.acquire(blocking=False):
+            return None
+        try:
             cached = self._printer_cache.get(engine_name)
             if cached is None:
                 return None
             if time.monotonic() - cached[0] >= self._PRINTER_CACHE_SECONDS:
                 return None
             return cached[1]
+        finally:
+            self._printer_lock.release()
 
     def catalog_status(self, engine_name: str | None = None) -> dict[str, Any]:
         engine = engine_name or self.store.load_settings().slicer_engine
@@ -188,19 +202,6 @@ class JobRunner:
     def warm_catalog(self, engine_name: str | None = None) -> dict[str, Any]:
         """Start a background full catalog scan for Cura or Orca (opt-in for Orca)."""
         engine = engine_name or self.store.load_settings().slicer_engine
-        with self._printer_lock:
-            cached = self._printer_cache.get(engine)
-            if (
-                cached is not None
-                and time.monotonic() - cached[0] < self._PRINTER_CACHE_SECONDS
-                and self._catalog_state.get(engine) == "ready"
-            ):
-                return self.catalog_status(engine)
-            if engine in self._warming:
-                return self.catalog_status(engine)
-            self._warming.add(engine)
-            self._catalog_state[engine] = "loading"
-            self._catalog_error[engine] = None
 
         def _run() -> None:
             try:
@@ -221,7 +222,24 @@ class JobRunner:
                 with self._printer_lock:
                     self._warming.discard(engine)
 
-        threading.Thread(target=_run, name=f"warm-{engine}-catalog", daemon=True).start()
+        start = False
+        with self._printer_lock:
+            cached = self._printer_cache.get(engine)
+            ready = (
+                cached is not None
+                and time.monotonic() - cached[0] < self._PRINTER_CACHE_SECONDS
+                and self._catalog_state.get(engine) == "ready"
+            )
+            # Status is read after this lock is released. Calling catalog_status
+            # here deadlocks: it takes the same non-reentrant lock, and every
+            # later printers/jobs request waits forever.
+            if not ready and engine not in self._warming:
+                self._warming.add(engine)
+                self._catalog_state[engine] = "loading"
+                self._catalog_error[engine] = None
+                start = True
+        if start:
+            threading.Thread(target=_run, name=f"warm-{engine}-catalog", daemon=True).start()
         return self.catalog_status(engine)
 
     def warm_printer_cache(self) -> None:
@@ -260,20 +278,26 @@ class JobRunner:
             now = time.monotonic()
             if self._filament_cache is not None and now - self._filament_cache[0] < 30:
                 return self._filament_cache[1]
-            found = discover_filaments(active_orca_dir())
-            self._filament_cache = (now, found)
+        # Scan outside the lock. Holding it here froze the printers page for
+        # the whole Orca filament walk (and forever, if that walk stalled).
+        found = discover_filaments(active_orca_dir())
+        with self._printer_lock:
+            self._filament_cache = (time.monotonic(), found)
             return found
 
     def start_batch(self) -> dict[str, Any]:
-        settings = self.store.load_settings()
-        if not settings.output_folder_name:
-            raise ValueError("output folder name is required")
         return self._start("batch", None, None)
 
+    def _owned_for_slice(self) -> list[dict[str, Any]]:
+        """Owned printers for a job, without a full engine catalog scan."""
+        owned = self.owned_snapshot()
+        healed = sync_owned_with_orca_user_profiles(owned, active_orca_dir())
+        if healed != owned:
+            self.store.save_owned(healed)
+            return healed
+        return owned
+
     def start_test(self, printer_id: str, item_type: str, item_name: str) -> dict[str, Any]:
-        settings = self.store.load_settings()
-        if not settings.output_folder_name:
-            raise ValueError("output folder name is required")
         if item_type not in {"model", "group"}:
             raise ValueError("item_type must be model or group")
         return self._start("test", printer_id, (item_type, item_name))
@@ -432,10 +456,15 @@ class JobRunner:
                 raise RuntimeError("a slice is already running")
             self._cancel.clear()
             settings = self.store.load_settings()
-            folder = safe_segment(settings.output_folder_name)
+            folder = settings.output_folder_name.strip()
+            if folder:
+                folder = safe_segment(folder)
             printers = [printer for printer in self.printers() if self._included(printer, printer_id)]
             if not printers:
                 raise ValueError("no enabled printer is available")
+            # Slice the printers already on the page. A full Cura/Orca catalog
+            # scan belongs to "Show every Orca printer", not to starting a job.
+            owned = self._owned_for_slice()
             groups_all = self.store.load_groups()
             arranged = _arranged_paths(groups_all)
             models = [
@@ -443,7 +472,6 @@ class JobRunner:
                 for model in list_models(model_root(self.store))
                 if str(model["path"]) not in arranged
             ]
-            owned = self.ensure_owned()
             included = self.store.load_locations().get("included")
             if selection is None:
                 chosen = {str(item) for item in included} if isinstance(included, list) else set()

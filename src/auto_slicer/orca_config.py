@@ -146,6 +146,11 @@ def load_orca_printer(
     if nozzles > 2:
         error = f"at most two extruders are supported; this machine has {nozzles}"
     display = display_name or orca_display_name(catalog_name)
+    center_zero = False
+    if isinstance(data, dict):
+        center_zero = area_is_center_zero(data.get("printable_area")) or str(
+            data.get("printer_structure") or ""
+        ).lower() == "delta"
     return PrinterProfile(
         id=f"orca:{catalog_name}",
         name=display,
@@ -158,7 +163,7 @@ def load_orca_printer(
         machine_width=width,
         machine_depth=depth,
         machine_height=height,
-        machine_center_is_zero=False,
+        machine_center_is_zero=center_zero,
         extruder_count=max(1, nozzles),
         setting_version=None,
         resource_setting_version=None,
@@ -254,6 +259,23 @@ def generic_pla(config_dir: Path) -> Path | None:
     return None
 
 
+def with_cli_printer_name(names: list[str] | None) -> list[str] | None:
+    """Include the empty name Orca uses for presets loaded through ``--load-settings``.
+
+    The CLI compares ``compatible_printers`` with the loaded printer preset's
+    internal name. That name stays empty for a JSON file passed on the command
+    line, so a list that only contains the visible printer name is reported as
+    incompatible (exit 239, ``process not compatible with printer``).
+    """
+    if not names:
+        return None
+    ordered = [""]
+    for name in names:
+        if name not in ordered:
+            ordered.append(name)
+    return ordered
+
+
 def write_process_profile(
     path: Path,
     settings: SliceSettings,
@@ -272,8 +294,9 @@ def write_process_profile(
     profile.update(orca_setting_overrides(settings))
     if extra:
         profile.update(extra)
-    if compatible_printers:
-        profile["compatible_printers"] = compatible_printers
+    printers = with_cli_printer_name(compatible_printers)
+    if printers:
+        profile["compatible_printers"] = printers
     path.write_text(json.dumps(profile, indent=2), encoding="utf-8")
 
 
@@ -294,9 +317,31 @@ def write_filament_profile(
     }
     if extra:
         profile.update(extra)
-    if compatible_printers:
-        profile["compatible_printers"] = compatible_printers
+    printers = with_cli_printer_name(compatible_printers)
+    if printers:
+        profile["compatible_printers"] = printers
     path.write_text(json.dumps(profile, indent=2), encoding="utf-8")
+
+
+def compatible_printer_names(
+    machine_json: dict[str, object] | None, fallback: str = ""
+) -> list[str] | None:
+    """Printer variant names a generated process/filament may be used with.
+
+    Orca rejects the slice with CLI_PROCESS_NOT_COMPATIBLE (-17) unless this
+    list contains the machine preset's name. ``printer_settings_id`` is included
+    when a profile uses it as the variant name instead of ``name``.
+    """
+    names: list[str] = []
+    if isinstance(machine_json, dict):
+        for key in ("name", "printer_settings_id"):
+            value = str(machine_json.get(key) or "").strip()
+            if value and value not in names:
+                names.append(value)
+    fallback_name = fallback.strip()
+    if fallback_name and fallback_name not in names:
+        names.append(fallback_name)
+    return names or None
 
 
 def process_inherits_for_machine(machine_json: dict[str, object] | None) -> str | None:
@@ -413,7 +458,9 @@ def build_orca_command(
         "--datadir",
         str(config_dir),
         "--load-settings",
-        f"{process_path};{printer.definition_path}",
+        # Machine first. Orca checks process compatibility against the printer
+        # already loaded, so a process-first list is rejected with exit -17.
+        f"{printer.definition_path};{process_path}",
         "--load-filaments",
         ";".join(str(path) for path in filaments),
         "--load-assemble-list",
@@ -451,7 +498,7 @@ def build_orca_arrange_command(
         "--datadir",
         str(config_dir),
         "--load-settings",
-        f"{process_path};{printer.definition_path}",
+        f"{printer.definition_path};{process_path}",
         "--load-filaments",
         ";".join(str(path) for path in filaments),
         "--arrange=1",

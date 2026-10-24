@@ -12,11 +12,13 @@ from auto_slicer.orca_config import (
     extract_plate_gcode,
     find_orca_machine_file,
     load_orca_printer,
+    compatible_printer_names,
     process_inherits_for_machine,
     search_filaments,
     write_assemble_list,
     write_process_profile,
 )
+from auto_slicer.orca_arrange import _arrange_process_extras
 from auto_slicer.settings_schema import SliceSettings, orca_setting_overrides
 
 
@@ -205,6 +207,8 @@ def test_orca_command_slices_without_arranging(tmp_path: Path) -> None:
     text = " ".join(command)
     assert "--slice" in command and "0" in command
     assert "--export-3mf" in command
+    settings = command[command.index("--load-settings") + 1]
+    assert settings.index(str(printer.definition_path)) < settings.index(str(tmp_path / "process.json"))
     assert "--load-settings" in command
     assert "--load-assemble-list" in command
     assert "--min-save" in command
@@ -271,6 +275,27 @@ def test_arrange_command_keeps_parts_separate_and_exports_full_3mf(tmp_path: Pat
     assert str(meshes[0]) in command and str(meshes[1]) in command
 
 
+def test_arrange_offset_is_half_a_brim_so_the_gap_matches() -> None:
+    extras = _arrange_process_extras(SliceSettings())
+    assert extras["brim_width"] == "2.5"
+    assert extras["brim_type"] == "outer_only"
+    assert extras["skirt_loops"] == "0"
+    touching = _arrange_process_extras(SliceSettings(orca_arrange_spacing=0))
+    assert touching["brim_type"] == "no_brim"
+    assert touching["brim_width"] == "0"
+    profile_path_values = orca_setting_overrides(SliceSettings())
+    profile_path_values.update(extras)
+    assert profile_path_values["brim_width"] == "2.5"
+
+
+def test_compatible_printer_names_include_the_variant_ids() -> None:
+    names = compatible_printer_names(
+        {"name": "Tenlog TL-D3 Pro 0.4 nozzle", "printer_settings_id": "Tenlog preset"},
+        "Tenlog",
+    )
+    assert names == ["Tenlog TL-D3 Pro 0.4 nozzle", "Tenlog preset", "Tenlog"]
+
+
 def test_process_profile_uses_the_machine_default_print_profile(tmp_path: Path) -> None:
     assert process_inherits_for_machine({"default_print_profile": "0.20mm Standard @Artillery X1"}) == (
         "0.20mm Standard @Artillery X1"
@@ -284,7 +309,7 @@ def test_process_profile_uses_the_machine_default_print_profile(tmp_path: Path) 
     )
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["inherits"] == "0.20mm Standard @Artillery X1"
-    assert payload["compatible_printers"] == ["Artillery Sidewinder X1 0.4 nozzle"]
+    assert payload["compatible_printers"] == ["", "Artillery Sidewinder X1 0.4 nozzle"]
 
 
 def test_orca_seam_is_stored_separately_from_cura() -> None:

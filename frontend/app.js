@@ -587,7 +587,7 @@ function renderSettings() {
   const general = settingsSection("General", "Shared across printers. Switching engine changes which seam options are shown.");
   appendFields(general.grid, [
     ["slicer_engine", "Slicing engine", "select", { options: options.slicer_engines, labels: { cura: "Cura", orca: "Orca" }, tip: "CuraEngine or OrcaSlicer for every slice." }],
-    ["output_folder_name", "Output folder name", "text", { tip: "Subfolder created under each printer in the output directory." }],
+    ["output_folder_name", "Output folder name", "text", { tip: "Optional subfolder under each printer. Leave blank to write gcode directly in the printer folder inside the output directory." }],
     ["rotation_x", "Shared rotation X", "number", { step: "1", tip: "Degrees applied to every part unless a part has its own rotation." }],
     ["rotation_y", "Shared rotation Y", "number", { step: "1", tip: "Degrees applied to every part unless a part has its own rotation." }],
     ["rotation_z", "Shared rotation Z", "number", { step: "1", tip: "Degrees applied to every part unless a part has its own rotation." }],
@@ -737,16 +737,20 @@ function renderSettings() {
 
   const arrange = settingsSection(
     "Group arrangement",
-    "Orca auto-arrange for groups. Parts stay separate objects; the arranged plate is saved as a .3mf beside the source files.",
+    "Gap between parts in a group. Orca saves the arranged plate as a .3mf beside the source files.",
   );
-  arrange.section.dataset.cluster = "orca-arrange";
-  arrange.section.classList.add("cluster");
   appendFields(arrange.grid, [
-    ["orca_arrange_spacing", "Spacing (0 = Auto)", "number", { step: "0.1", tip: "Minimum gap between parts. 0 uses Orca Auto spacing (brim-aware)." }],
+    ["orca_arrange_spacing", "Offset between parts (mm)", "number", { step: "0.1", tip: "Edge-to-edge gap used when arranging a group. Default is 5 mm. This does not change the brim used when slicing." }],
+  ]);
+  const orcaArrange = document.createElement("div");
+  orcaArrange.className = "grid cluster";
+  orcaArrange.dataset.cluster = "orca-arrange";
+  appendFields(orcaArrange, [
     ["orca_arrange_rotate", "Auto rotate for arrangement", "checkbox", { tip: "Let Orca rotate parts on the bed while packing." }],
     ["orca_arrange_multicolor", "Allow multiple materials on same plate", "checkbox", { tip: "Keep differently coloured parts on one plate when arranging." }],
-    ["orca_arrange_align_y", "Align to Y axis", "checkbox", { tip: "Prefer aligning parts along Y to reduce bed motion on i3-style printers." }],
+    ["orca_arrange_align_y", "Align to Y axis", "checkbox", { tip: "Unchecked: the long edge of each grouped part follows X. Checked: Orca turns that edge onto Y." }],
   ]);
+  arrange.section.append(orcaArrange);
   form.append(arrange.section);
 
   for (const input of form.querySelectorAll("input, select")) {
@@ -3014,17 +3018,18 @@ try {
   renderJob(early[7]);
   renderFilaments();
 
-  const [printers, owned, editJob] = await Promise.all([
-    api("/api/printers"),
-    api("/api/owned"),
-    api("/api/gcode-edit/current"),
-  ]);
+  const printersPromise = api("/api/printers");
+  const ownedPromise = api("/api/owned");
+  const editPromise = api("/api/gcode-edit/current");
+  const printers = await printersPromise;
   state.printers = printers;
+  renderPrinters();
+  $("engine-status").textContent = `${curaReady ? "CuraEngine ready" : "CuraEngine was not found"} · ${early[0].orca_engine ? "OrcaSlicer ready" : "OrcaSlicer was not found"}`;
+  const [owned, editJob] = await Promise.all([ownedPromise, editPromise]);
   state.owned = owned;
   if (!state.selectedOwnedId && owned.printers?.[0]) {
     state.selectedOwnedId = owned.printers[0].id;
   }
-  $("engine-status").textContent = `${curaReady ? "CuraEngine ready" : "CuraEngine was not found"} · ${early[0].orca_engine ? "OrcaSlicer ready" : "OrcaSlicer was not found"}`;
   setOrcaCatalogStatus("idle");
   renderPrinters();
   renderOwned();

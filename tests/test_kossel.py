@@ -14,6 +14,7 @@ from auto_slicer.orca_config import (
     bundled_orca_profiles_dir,
     circular_printable_area,
     discover_orca_printers,
+    load_orca_printer,
     orca_origin,
 )
 from auto_slicer.settings_schema import SliceSettings
@@ -33,6 +34,13 @@ def test_bundled_kossel_profile_is_discovered() -> None:
     assert match.machine_depth == 230
     assert match.machine_height == 300
     assert match.extruder_count == 1
+    linked = load_orca_printer(
+        root,
+        "orca:Anycubic Kossel Linear Plus 0.4 nozzle",
+        display_name="Anycubic Kossel Linear Plus",
+    )
+    assert linked is not None
+    assert linked.machine_center_is_zero is True
 
 
 def test_merge_owned_seeds_kossel_from_orca_catalog() -> None:

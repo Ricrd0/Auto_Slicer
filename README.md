@@ -10,7 +10,7 @@ The web app calls the slicer directly. No language model is involved.
 
 On Windows the app reads `%APPDATA%\cura\5.13` when `data/cura-config` is empty, and Docker mounts that folder read-only. To use a copy instead, put the version folder (the one that contains `machine_instances`) in `data/cura-config`. Orca profiles are read from `%APPDATA%\OrcaSlicer`, which Docker mounts at `/host-orca`.
 
-The Models tab has Browse buttons for the input folder and the output directory. Docker Desktop shares every attached drive through one mount, and Browse lists the drives that are present when it opens. The output folder name in Settings is the shared subfolder written under each printer.
+The Models tab has Browse buttons for the input folder and the output directory. Docker Desktop shares every attached drive through one mount, and Browse lists the drives that are present when it opens. The output folder name in Settings is an optional subfolder written under each printer. Leave it blank to write gcode directly in each printer folder.
 
 ```bash
 docker compose build

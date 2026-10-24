@@ -160,8 +160,10 @@ def create_app(paths: DataPaths | None = None) -> FastAPI:
             owned = runner.ensure_owned(cura_printers=cura, orca_printers=orca)
         else:
             owned = runner.owned_snapshot()
-            cura = runner.cached_discovered("cura") or []
-            orca = runner.cached_discovered("orca") or []
+            # Don't wait on the catalog lock. A warm that deadlocks that lock
+            # used to leave this request hanging, so the printers table never painted.
+            cura = runner.cached_discovered("cura", wait=False) or []
+            orca = runner.cached_discovered("orca", wait=False) or []
             if not orca:
                 # Dropdown can list linked profiles without a full catalog warm.
                 orca = runner.resolve_owned_orca(owned)

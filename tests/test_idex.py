@@ -112,6 +112,13 @@ def test_output_paths_get_mode_suffixes() -> None:
     assert group.as_posix().endswith("groups/pipes_mirror.gcode")
 
 
+def test_blank_output_folder_writes_under_the_printer() -> None:
+    model = output_model_path("Tenlog", "  ", "folder/part.stl", False)
+    assert model.as_posix() == "Tenlog/folder/part.gcode"
+    group = output_group_path("Tenlog", "", "pipes", True)
+    assert group.as_posix() == "Tenlog/_test/groups/pipes.gcode"
+
+
 def test_single_model_uses_idex_zone_then_falls_back() -> None:
     name, triangles = _part("wall.stl", 20, 10, 5)
     part = footprint_of(name, triangles, (0, 0, 0))

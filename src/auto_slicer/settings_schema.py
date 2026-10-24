@@ -128,10 +128,10 @@ class SliceSettings:
     support_structure: SupportStructure = "normal"
     support_angle: float = 50.0
     support_infill_rate: float = 15.0
-    orca_arrange_spacing: float = 0.0
+    orca_arrange_spacing: float = 5.0
     orca_arrange_rotate: bool = False
     orca_arrange_multicolor: bool = True
-    orca_arrange_align_y: bool = True
+    orca_arrange_align_y: bool = False
 
     def validate(self) -> None:
         if self.output_folder_name:
@@ -190,10 +190,8 @@ class SliceSettings:
 
 
 def pack_gap(settings: SliceSettings) -> float:
-    """A few millimetres, and at least the brim width when a brim is used."""
-    if settings.adhesion_type == "brim":
-        return max(5.0, settings.brim_width)
-    return 5.0
+    """Edge-to-edge gap when a group layout is packed here instead of by Orca."""
+    return settings.orca_arrange_spacing
 
 
 def wall_loops_for(wall_thickness: float, nozzle_diameter: float = 0.4) -> int:
