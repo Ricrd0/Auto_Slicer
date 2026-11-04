@@ -2,17 +2,22 @@ import {
   AmbientLight,
   BufferAttribute,
   BufferGeometry,
+  CanvasTexture,
   Color,
   DirectionalLight,
   DoubleSide,
+  Group,
   Line,
   LineBasicMaterial,
   LineLoop,
+  LineSegments,
   Mesh,
   MeshStandardMaterial,
   PerspectiveCamera,
   Raycaster,
   Scene,
+  Sprite,
+  SpriteMaterial,
   Vector2,
   Vector3,
   WebGLRenderer,
@@ -139,6 +144,9 @@ function geometryFromPositions(positions, rotation, scale = 1) {
   return geometry;
 }
 
+const BED_GRID_MAJOR = 50;
+const BED_GRID_MINOR = 10;
+
 const preview = setupViewport($("preview"), 0x241f1a);
 const gcodeView = setupViewport($("gcode-view"), 0x16130f);
 const bed = new LineLoop(
@@ -146,12 +154,18 @@ const bed = new LineLoop(
   new LineBasicMaterial({ color: 0xf4e1c1 }),
 );
 preview.scene.add(bed);
+const bedGuides = new Group();
+bedGuides.userData.bedGuides = true;
+preview.scene.add(bedGuides);
 const gcodeBed = new LineLoop(
   new BufferGeometry(),
   new LineBasicMaterial({ color: 0xf4e1c1 }),
 );
 gcodeBed.userData.bed = true;
 gcodeView.scene.add(gcodeBed);
+const gcodeBedGuides = new Group();
+gcodeBedGuides.userData.bedGuides = true;
+gcodeView.scene.add(gcodeBedGuides);
 const partMaterial = new MeshStandardMaterial({ color: 0xc4a484, roughness: 0.7, metalness: 0.0, side: DoubleSide });
 const selectedMaterial = new MeshStandardMaterial({ color: 0xe7c8a0, roughness: 0.55, metalness: 0.0, side: DoubleSide });
 
@@ -186,14 +200,156 @@ function setupViewport(canvas, clear) {
   return { canvas, renderer, scene, camera, orbit };
 }
 
+function disposeObjectTree(root) {
+  for (const child of [...root.children]) {
+    root.remove(child);
+    child.traverse((object) => {
+      if (object.geometry) object.geometry.dispose();
+      const materials = object.material
+        ? Array.isArray(object.material)
+          ? object.material
+          : [object.material]
+        : [];
+      for (const material of materials) {
+        if (material.map) material.map.dispose();
+        material.dispose();
+      }
+    });
+  }
+}
+
+function makeBedLabel(text, { color = "#f4e1c1", fontSize = 64, worldHeight = 12 } = {}) {
+  const canvas = document.createElement("canvas");
+  const context = canvas.getContext("2d");
+  const font = `600 ${fontSize}px "Segoe UI", sans-serif`;
+  context.font = font;
+  const width = Math.ceil(context.measureText(text).width + fontSize * 0.6);
+  const height = Math.ceil(fontSize * 1.45);
+  canvas.width = Math.max(width, 8);
+  canvas.height = Math.max(height, 8);
+  context.font = font;
+  context.fillStyle = color;
+  context.textAlign = "center";
+  context.textBaseline = "middle";
+  context.fillText(text, canvas.width / 2, canvas.height / 2);
+  const texture = new CanvasTexture(canvas);
+  texture.needsUpdate = true;
+  const material = new SpriteMaterial({
+    map: texture,
+    transparent: true,
+    depthTest: false,
+    depthWrite: false,
+  });
+  const sprite = new Sprite(material);
+  const aspect = canvas.width / canvas.height;
+  sprite.scale.set(worldHeight * aspect, worldHeight, 1);
+  sprite.renderOrder = 2;
+  return sprite;
+}
+
+function pushSegment(points, ax, ay, az, bx, by, bz) {
+  points.push(ax, ay, az, bx, by, bz);
+}
+
+function isMajorGrid(value) {
+  const nearest = Math.round(value / BED_GRID_MAJOR) * BED_GRID_MAJOR;
+  return Math.abs(nearest - value) < 1e-6;
+}
+
+function bedScaleStops(size, step) {
+  const stops = new Set([0, size]);
+  for (let value = step; value < size - 1e-6; value += step) stops.add(value);
+  return [...stops].sort((a, b) => a - b);
+}
+
+function updateBedGuides(group, width, depth) {
+  disposeObjectTree(group);
+  if (!width || !depth || width <= 0 || depth <= 0) {
+    group.visible = false;
+    return;
+  }
+  group.visible = true;
+
+  const minorPoints = [];
+  const majorPoints = [];
+  const tickPoints = [];
+  const tick = Math.max(4, Math.min(width, depth) * 0.018);
+  const labelHeight = Math.max(10, Math.min(width, depth) * 0.045);
+  const axisHeight = labelHeight * 1.35;
+  const labelGap = Math.max(10, labelHeight * 0.85);
+
+  for (let x = BED_GRID_MINOR; x < width - 1e-6; x += BED_GRID_MINOR) {
+    pushSegment(isMajorGrid(x) ? majorPoints : minorPoints, x, 0, 0, x, depth, 0);
+  }
+  for (let y = BED_GRID_MINOR; y < depth - 1e-6; y += BED_GRID_MINOR) {
+    pushSegment(isMajorGrid(y) ? majorPoints : minorPoints, 0, y, 0, width, y, 0);
+  }
+
+  for (const x of bedScaleStops(width, BED_GRID_MAJOR)) {
+    pushSegment(tickPoints, x, 0, 0, x, -tick, 0);
+    pushSegment(tickPoints, x, depth, 0, x, depth + tick, 0);
+  }
+  for (const y of bedScaleStops(depth, BED_GRID_MAJOR)) {
+    pushSegment(tickPoints, 0, y, 0, -tick, y, 0);
+    pushSegment(tickPoints, width, y, 0, width + tick, y, 0);
+  }
+
+  if (minorPoints.length) {
+    const geometry = new BufferGeometry();
+    geometry.setAttribute("position", new BufferAttribute(new Float32Array(minorPoints), 3));
+    group.add(
+      new LineSegments(
+        geometry,
+        new LineBasicMaterial({ color: 0x5c5044, transparent: true, opacity: 0.35 }),
+      ),
+    );
+  }
+  if (majorPoints.length) {
+    const geometry = new BufferGeometry();
+    geometry.setAttribute("position", new BufferAttribute(new Float32Array(majorPoints), 3));
+    group.add(
+      new LineSegments(
+        geometry,
+        new LineBasicMaterial({ color: 0xa89278, transparent: true, opacity: 0.7 }),
+      ),
+    );
+  }
+  if (tickPoints.length) {
+    const geometry = new BufferGeometry();
+    geometry.setAttribute("position", new BufferAttribute(new Float32Array(tickPoints), 3));
+    group.add(new LineSegments(geometry, new LineBasicMaterial({ color: 0xf4e1c1 })));
+  }
+
+  for (const x of bedScaleStops(width, BED_GRID_MAJOR)) {
+    const label = makeBedLabel(formatMm(x), { worldHeight: labelHeight });
+    label.position.set(x, -labelGap, 0.2);
+    group.add(label);
+  }
+  for (const y of bedScaleStops(depth, BED_GRID_MAJOR)) {
+    if (y === 0) continue;
+    const label = makeBedLabel(formatMm(y), { worldHeight: labelHeight });
+    label.position.set(-labelGap, y, 0.2);
+    group.add(label);
+  }
+
+  const xAxis = makeBedLabel("X", { color: "#ffb4a2", worldHeight: axisHeight, fontSize: 72 });
+  xAxis.position.set(width + labelGap * 1.4, 0, 0.2);
+  group.add(xAxis);
+
+  const yAxis = makeBedLabel("Y", { color: "#9ad0c2", worldHeight: axisHeight, fontSize: 72 });
+  yAxis.position.set(0, depth + labelGap * 1.4, 0.2);
+  group.add(yAxis);
+}
+
 function setBed(width, depth) {
   preview.bedWidth = width;
   preview.bedDepth = depth;
   const points = [new Vector3(0, 0, 0), new Vector3(width, 0, 0), new Vector3(width, depth, 0), new Vector3(0, depth, 0)];
   bed.geometry.dispose();
   bed.geometry = new BufferGeometry().setFromPoints(points);
+  updateBedGuides(bedGuides, width, depth);
   preview.orbit.target.set(width / 2, depth / 2, 0);
-  preview.orbit.radius = Math.max(width, depth) * 1.3;
+  preview.orbit.radius = Math.max(width, depth) * 1.45;
 }
 
 function clearParts() {
@@ -1157,6 +1313,7 @@ function setGcodeBed(width, depth) {
     gcodeBed.visible = false;
     gcodeBed.geometry.dispose();
     gcodeBed.geometry = new BufferGeometry();
+    updateBedGuides(gcodeBedGuides, 0, 0);
     return;
   }
   state.gcodeBed = { width, depth };
@@ -1169,6 +1326,7 @@ function setGcodeBed(width, depth) {
   ];
   gcodeBed.geometry.dispose();
   gcodeBed.geometry = new BufferGeometry().setFromPoints(points);
+  updateBedGuides(gcodeBedGuides, width, depth);
 }
 
 function updateGcodeSelectionLabel() {
@@ -1369,11 +1527,12 @@ function gcodeFrameBounds(toolMin, toolMax) {
   const max = { ...toolMax };
   const bed = state.gcodeBed;
   if (bed) {
-    min.x = Math.min(min.x, 0);
-    min.y = Math.min(min.y, 0);
+    const pad = Math.max(16, Math.min(bed.width, bed.depth) * 0.08);
+    min.x = Math.min(min.x, -pad);
+    min.y = Math.min(min.y, -pad);
     min.z = Math.min(min.z, 0);
-    max.x = Math.max(max.x, bed.width);
-    max.y = Math.max(max.y, bed.depth);
+    max.x = Math.max(max.x, bed.width + pad);
+    max.y = Math.max(max.y, bed.depth + pad);
     max.z = Math.max(max.z, 0);
   }
   return { min, max };
