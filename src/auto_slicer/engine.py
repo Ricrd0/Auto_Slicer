@@ -102,15 +102,11 @@ def run_slice(
     should_cancel: Callable[[], bool] | None = None,
     on_start: Callable[[subprocess.Popen[str]], None] | None = None,
     on_finish: Callable[[subprocess.Popen[str]], None] | None = None,
-    use_xvfb: bool = False,
 ) -> tuple[int, str]:
     env = os.environ.copy()
     if library_path:
         previous = env.get("LD_LIBRARY_PATH", "")
         env["LD_LIBRARY_PATH"] = library_path + (":" + previous if previous else "")
-    if use_xvfb:
-        env["LIBGL_ALWAYS_SOFTWARE"] = "1"
-        command = ["xvfb-run", "-a", "-s", "-screen 0 1024x768x24"] + command
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,

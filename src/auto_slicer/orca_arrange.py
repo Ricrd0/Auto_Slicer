@@ -139,7 +139,7 @@ def arrange_group(
             filaments,
             settings,
         )
-        code, tail = run_slice(command, library_path, use_xvfb=True)
+        code, tail = run_slice(command, library_path)
         if code != 0 or not export_path.is_file() or export_path.stat().st_size == 0:
             raise EngineError(tail or f"OrcaSlicer arrange exited with status {code}")
         payload = export_path.read_bytes()

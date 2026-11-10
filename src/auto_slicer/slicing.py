@@ -17,6 +17,7 @@ from auto_slicer.machine_sync import (
     orca_process_extras,
     patch_orca_machine,
 )
+from auto_slicer.thumbnails import inject_thumbnails_into_gcode, parse_thumbnail_sizes
 from auto_slicer.meshio import Triangle, load_model, transform_mesh, write_stl
 from auto_slicer.orca_arrange import arrange_group, layout_from_arranged_3mf
 from auto_slicer.orca_config import (
@@ -636,18 +637,62 @@ def _run_orca(
         should_cancel=should_cancel,
         on_start=on_process_start,
         on_finish=on_process_finish,
-        use_xvfb=True,
     )
     if code != 0 or not archive.is_file() or archive.stat().st_size == 0:
         raise EngineError(tail or f"OrcaSlicer exited with status {code}")
     extract_plate_gcode(archive, output)
     if not output.is_file() or output.stat().st_size == 0:
         raise EngineError(tail or "OrcaSlicer did not produce gcode")
+    _inject_thumbnails(output, prepared, printer, machine)
     return _header_from_file(output, machine=machine)
 
 
 def _printer_with_machine_path(printer: PrinterProfile, path: Path) -> PrinterProfile:
     return replace(printer, definition_path=str(path))
+
+
+def _inject_thumbnails(
+    gcode_path: Path,
+    prepared: PreparedSlice,
+    printer: PrinterProfile,
+    machine: dict[str, object] | None,
+) -> None:
+    """Generate and inject thumbnail images into gcode file."""
+    try:
+        # Parse thumbnail sizes from machine or printer profile
+        thumbnails_setting = None
+        if machine and machine.get("thumbnails"):
+            thumbnails_setting = machine["thumbnails"]
+        elif hasattr(printer, "thumbnails") and printer.thumbnails:
+            thumbnails_setting = printer.thumbnails
+        
+        # Try to get from definition file if available
+        if not thumbnails_setting and printer.definition_path:
+            try:
+                import json
+                definition = Path(printer.definition_path)
+                if definition.is_file():
+                    data = json.loads(definition.read_text(encoding="utf-8"))
+                    thumbnails_setting = data.get("thumbnails")
+            except Exception:
+                pass
+        
+        sizes = parse_thumbnail_sizes(thumbnails_setting)
+        if not sizes:
+            return
+        
+        # Load all triangles from the prepared meshes
+        from auto_slicer.meshio import load_model
+        all_triangles = []
+        for mesh_path in prepared.meshes:
+            triangles = load_model(mesh_path.name, mesh_path.read_bytes())
+            all_triangles.extend(triangles)
+        
+        if all_triangles:
+            inject_thumbnails_into_gcode(gcode_path, all_triangles, sizes)
+    except Exception:
+        # Don't fail the whole slice if thumbnail generation fails
+        pass
 
 
 def _header_from_file(
