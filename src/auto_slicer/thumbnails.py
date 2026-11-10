@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import io
+import math
 import re
 from pathlib import Path
 
@@ -20,9 +21,24 @@ def render_thumbnail(
     triangles: list[Triangle],
     size: tuple[int, int],
     bg_color: tuple[int, int, int] = (32, 32, 32),
-    mesh_color: tuple[int, int, int] = (200, 200, 200),
+    mesh_color: tuple[int, int, int] = (0, 174, 66),  # Orca green #00AE42
+    decimate_threshold: int = 100000,
 ) -> bytes:
-    """Render a simple orthographic projection of a mesh as PNG.
+    """Render an isometric 3/4 view of a mesh with Lambert shading.
+    
+    Creates a thumbnail similar to OrcaSlicer's plate preview:
+    - Angled isometric view (not top-down)
+    - Per-face Lambert shading based on normals
+    - Orca green filament color
+    - Dark background
+    - Model centered and scaled to fill frame
+    
+    Args:
+        triangles: List of triangles to render
+        size: Output image size (width, height)
+        bg_color: Background RGB color
+        mesh_color: Base mesh RGB color (before lighting)
+        decimate_threshold: Decimate if more than this many triangles
     
     Returns PNG bytes suitable for embedding in gcode.
     """
@@ -34,62 +50,157 @@ def render_thumbnail(
     
     width, height = size
     
-    # Extract all vertices (Triangle is tuple[Vertex, Vertex, Vertex])
-    vertices = []
-    for tri in triangles:
-        vertices.extend([tri[0], tri[1], tri[2]])
+    # Decimate if mesh is too large (simple stride-based decimation)
+    if len(triangles) > decimate_threshold:
+        stride = len(triangles) // decimate_threshold + 1
+        triangles = triangles[::stride]
     
-    # Calculate bounds
-    xs = [v[0] for v in vertices]
-    ys = [v[1] for v in vertices]
-    zs = [v[2] for v in vertices]
+    # Calculate mesh bounds
+    xs, ys, zs = [], [], []
+    for tri in triangles:
+        for v in tri:
+            xs.append(v[0])
+            ys.append(v[1])
+            zs.append(v[2])
     
     min_x, max_x = min(xs), max(xs)
     min_y, max_y = min(ys), max(ys)
     min_z, max_z = min(zs), max(zs)
     
-    # Use X-Y plane (top view) for projection
-    range_x = max_x - min_x if max_x > min_x else 1.0
-    range_y = max_y - min_y if max_y > min_y else 1.0
+    # Center the model
+    center_x = (min_x + max_x) / 2.0
+    center_y = (min_y + max_y) / 2.0
+    center_z = (min_z + max_z) / 2.0
     
-    # Scale to fit with padding
-    padding = 0.1
-    scale = min(width, height) * (1.0 - 2 * padding) / max(range_x, range_y)
+    # Model size
+    size_x = max_x - min_x if max_x > min_x else 1.0
+    size_y = max_y - min_y if max_y > min_y else 1.0
+    size_z = max_z - min_z if max_z > min_z else 1.0
+    max_size = max(size_x, size_y, size_z)
+    
+    # Isometric view: rotate 45° around Z, then ~35° around X
+    # This gives a nice 3/4 view like OrcaSlicer
+    rot_z = math.radians(45)  # Rotate around Z (yaw)
+    rot_x = math.radians(35)  # Rotate around X (pitch)
+    
+    cos_z, sin_z = math.cos(rot_z), math.sin(rot_z)
+    cos_x, sin_x = math.cos(rot_x), math.sin(rot_x)
+    
+    def rotate_and_project(x: float, y: float, z: float) -> tuple[float, float, float]:
+        """Apply isometric rotation and return rotated 3D point."""
+        # Center
+        x, y, z = x - center_x, y - center_y, z - center_z
+        
+        # Rotate around Z axis (yaw)
+        x2 = x * cos_z - y * sin_z
+        y2 = x * sin_z + y * cos_z
+        z2 = z
+        
+        # Rotate around X axis (pitch)
+        y3 = y2 * cos_x - z2 * sin_x
+        z3 = y2 * sin_x + z2 * cos_x
+        x3 = x2
+        
+        return x3, y3, z3
+    
+    def project_to_screen(x3: float, y3: float, z3: float) -> tuple[float, float]:
+        """Orthographic projection to screen coordinates."""
+        # Scale to fit in image with padding
+        padding = 0.08
+        scale = min(width, height) * (1.0 - 2 * padding) / max_size
+        
+        # Project (orthographic, ignore Z for projection)
+        px = x3 * scale + width / 2
+        py = height / 2 - y3 * scale
+        
+        return px, py
+    
+    def calculate_normal(tri: Triangle) -> tuple[float, float, float]:
+        """Calculate face normal vector."""
+        v0, v1, v2 = tri
+        
+        # Edge vectors
+        e1 = (v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2])
+        e2 = (v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2])
+        
+        # Cross product
+        nx = e1[1] * e2[2] - e1[2] * e2[1]
+        ny = e1[2] * e2[0] - e1[0] * e2[2]
+        nz = e1[0] * e2[1] - e1[1] * e2[0]
+        
+        # Normalize
+        length = math.sqrt(nx * nx + ny * ny + nz * nz)
+        if length > 0:
+            nx, ny, nz = nx / length, ny / length, nz / length
+        
+        return nx, ny, nz
+    
+    # Light direction (from upper-front-right, typical for 3D rendering)
+    light_dir = (0.3, -0.5, 0.8)
+    light_length = math.sqrt(sum(x * x for x in light_dir))
+    light_dir = tuple(x / light_length for x in light_dir)
+    
+    # Ambient light
+    ambient = 0.35
+    
+    # Transform triangles and calculate lighting
+    transformed = []
+    for tri in triangles:
+        # Calculate normal in original space
+        normal = calculate_normal(tri)
+        
+        # Rotate normal
+        nx, ny, nz = normal
+        # Rotate around Z
+        nx2 = nx * cos_z - ny * sin_z
+        ny2 = nx * sin_z + ny * cos_z
+        nz2 = nz
+        # Rotate around X
+        ny3 = ny2 * cos_x - nz2 * sin_x
+        nz3 = ny2 * sin_x + nz2 * cos_x
+        nx3 = nx2
+        
+        rotated_normal = (nx3, ny3, nz3)
+        
+        # Backface culling: skip if facing away (normal Z < 0 means back face)
+        if nz3 < 0:
+            continue
+        
+        # Lambert shading: dot product of normal and light direction
+        dot = sum(n * l for n, l in zip(rotated_normal, light_dir))
+        diffuse = max(0.0, dot)
+        
+        # Total lighting
+        intensity = ambient + (1.0 - ambient) * diffuse
+        intensity = max(0.0, min(1.0, intensity))
+        
+        # Transform vertices
+        v0_rot = rotate_and_project(*tri[0])
+        v1_rot = rotate_and_project(*tri[1])
+        v2_rot = rotate_and_project(*tri[2])
+        
+        # Average Z for depth sorting
+        z_avg = (v0_rot[2] + v1_rot[2] + v2_rot[2]) / 3.0
+        
+        p0 = project_to_screen(*v0_rot)
+        p1 = project_to_screen(*v1_rot)
+        p2 = project_to_screen(*v2_rot)
+        
+        # Calculate lit color
+        color = tuple(int(c * intensity) for c in mesh_color)
+        
+        transformed.append((z_avg, [p0, p1, p2], color))
+    
+    # Sort by depth (painter's algorithm: back to front)
+    transformed.sort(key=lambda item: item[0])
     
     # Create image
     image = Image.new('RGB', (width, height), bg_color)
     draw = ImageDraw.Draw(image)
     
-    def project(x: float, y: float) -> tuple[float, float]:
-        """Project 3D point to 2D image coordinates."""
-        px = (x - min_x) * scale + width * padding
-        py = height - ((y - min_y) * scale + height * padding)
-        return px, py
-    
-    # Draw triangles with simple z-ordering (painter's algorithm)
-    tri_data = []
-    for tri in triangles:
-        center_z = (tri[0][2] + tri[1][2] + tri[2][2]) / 3.0
-        tri_data.append((center_z, tri))
-    
-    tri_data.sort(key=lambda item: item[0])
-    
-    # Draw each triangle
-    for _, tri in tri_data:
-        p1 = project(tri[0][0], tri[0][1])
-        p2 = project(tri[1][0], tri[1][1])
-        p3 = project(tri[2][0], tri[2][1])
-        
-        # Calculate shading based on Z height
-        z_avg = (tri[0][2] + tri[1][2] + tri[2][2]) / 3.0
-        z_range = max_z - min_z if max_z > min_z else 1.0
-        z_factor = (z_avg - min_z) / z_range
-        
-        # Lighter color for higher Z
-        shade_factor = 0.5 + 0.5 * z_factor
-        color = tuple(int(c * shade_factor) for c in mesh_color)
-        
-        draw.polygon([p1, p2, p3], fill=color, outline=None)
+    # Draw triangles back to front
+    for _, points, color in transformed:
+        draw.polygon(points, fill=color)
     
     # Convert to PNG bytes
     buffer = io.BytesIO()
