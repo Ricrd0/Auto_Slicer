@@ -72,12 +72,6 @@ def render_thumbnail(
     center_y = (min_y + max_y) / 2.0
     center_z = (min_z + max_z) / 2.0
     
-    # Model size
-    size_x = max_x - min_x if max_x > min_x else 1.0
-    size_y = max_y - min_y if max_y > min_y else 1.0
-    size_z = max_z - min_z if max_z > min_z else 1.0
-    max_size = max(size_x, size_y, size_z)
-    
     # Isometric view: rotate 45° around Z, then ~35° around X
     # This gives a nice 3/4 view like OrcaSlicer
     rot_z = math.radians(45)  # Rotate around Z (yaw)
@@ -86,7 +80,7 @@ def render_thumbnail(
     cos_z, sin_z = math.cos(rot_z), math.sin(rot_z)
     cos_x, sin_x = math.cos(rot_x), math.sin(rot_x)
     
-    def rotate_and_project(x: float, y: float, z: float) -> tuple[float, float, float]:
+    def rotate_point(x: float, y: float, z: float) -> tuple[float, float, float]:
         """Apply isometric rotation and return rotated 3D point."""
         # Center
         x, y, z = x - center_x, y - center_y, z - center_z
@@ -103,17 +97,40 @@ def render_thumbnail(
         
         return x3, y3, z3
     
-    def project_to_screen(x3: float, y3: float, z3: float) -> tuple[float, float]:
-        """Orthographic projection to screen coordinates."""
-        # Scale to fit in image with padding
-        padding = 0.08
-        scale = min(width, height) * (1.0 - 2 * padding) / max_size
+    # First pass: rotate all vertices to find projected 2D bounding box
+    projected_xs = []
+    projected_ys = []
+    
+    for tri in triangles:
+        for v in tri:
+            x3, y3, z3 = rotate_point(*v)
+            projected_xs.append(x3)
+            projected_ys.append(y3)
+    
+    # Calculate 2D bounding box of projected points
+    proj_min_x, proj_max_x = min(projected_xs), max(projected_xs)
+    proj_min_y, proj_max_y = min(projected_ys), max(projected_ys)
+    
+    proj_width = proj_max_x - proj_min_x if proj_max_x > proj_min_x else 1.0
+    proj_height = proj_max_y - proj_min_y if proj_max_y > proj_min_y else 1.0
+    
+    # Calculate scale to fit projected bbox with margin (8%)
+    margin = 0.08
+    scale_x = width * (1.0 - 2 * margin) / proj_width
+    scale_y = height * (1.0 - 2 * margin) / proj_height
+    scale = min(scale_x, scale_y)  # Preserve aspect ratio
+    
+    # Center offset to position model in frame
+    proj_center_x = (proj_min_x + proj_max_x) / 2.0
+    proj_center_y = (proj_min_y + proj_max_y) / 2.0
+    
+    def project_to_screen(x3: float, y3: float, z3: float) -> tuple[float, float, float]:
+        """Orthographic projection to screen coordinates, returns (px, py, z)."""
+        # Scale and center
+        px = (x3 - proj_center_x) * scale + width / 2
+        py = height / 2 - (y3 - proj_center_y) * scale
         
-        # Project (orthographic, ignore Z for projection)
-        px = x3 * scale + width / 2
-        py = height / 2 - y3 * scale
-        
-        return px, py
+        return px, py, z3
     
     def calculate_normal(tri: Triangle) -> tuple[float, float, float]:
         """Calculate face normal vector."""
@@ -135,6 +152,61 @@ def render_thumbnail(
         
         return nx, ny, nz
     
+    def _rasterize_triangle(
+        p0: tuple[float, float, float],
+        p1: tuple[float, float, float],
+        p2: tuple[float, float, float],
+        color: tuple[int, int, int],
+        color_buffer: np.ndarray,
+        z_buffer: np.ndarray,
+        img_width: int,
+        img_height: int,
+    ) -> None:
+        """Rasterize a triangle with z-buffer testing."""
+        x0, y0, z0 = p0
+        x1, y1, z1 = p1
+        x2, y2, z2 = p2
+        
+        # Bounding box
+        min_x = max(0, int(min(x0, x1, x2)))
+        max_x = min(img_width - 1, int(max(x0, x1, x2)) + 1)
+        min_y = max(0, int(min(y0, y1, y2)))
+        max_y = min(img_height - 1, int(max(y0, y1, y2)) + 1)
+        
+        # Edge function helper
+        def edge_function(ax: float, ay: float, bx: float, by: float, cx: float, cy: float) -> float:
+            return (cx - ax) * (by - ay) - (cy - ay) * (bx - ax)
+        
+        # Calculate triangle area (for barycentric coordinates)
+        area = edge_function(x0, y0, x1, y1, x2, y2)
+        if abs(area) < 0.0001:  # Degenerate triangle
+            return
+        
+        # Scan bounding box
+        for y in range(min_y, max_y + 1):
+            for x in range(min_x, max_x + 1):
+                px, py = x + 0.5, y + 0.5  # Pixel center
+                
+                # Barycentric coordinates
+                w0 = edge_function(x1, y1, x2, y2, px, py)
+                w1 = edge_function(x2, y2, x0, y0, px, py)
+                w2 = edge_function(x0, y0, x1, y1, px, py)
+                
+                # Check if point is inside triangle
+                if w0 >= 0 and w1 >= 0 and w2 >= 0:
+                    # Normalize barycentric coordinates
+                    w0 /= area
+                    w1 /= area
+                    w2 /= area
+                    
+                    # Interpolate Z
+                    z = w0 * z0 + w1 * z1 + w2 * z2
+                    
+                    # Z-buffer test
+                    if z < z_buffer[y, x]:
+                        z_buffer[y, x] = z
+                        color_buffer[y, x] = color
+    
     # Light direction (from upper-front-right, typical for 3D rendering)
     light_dir = (0.3, -0.5, 0.8)
     light_length = math.sqrt(sum(x * x for x in light_dir))
@@ -143,8 +215,11 @@ def render_thumbnail(
     # Ambient light
     ambient = 0.35
     
-    # Transform triangles and calculate lighting
-    transformed = []
+    # Create color buffer and z-buffer
+    color_buffer = np.full((height, width, 3), bg_color[:3], dtype=np.uint8)
+    z_buffer = np.full((height, width), float('inf'), dtype=np.float32)
+    
+    # Transform triangles and rasterize with z-buffer
     for tri in triangles:
         # Calculate normal in original space
         normal = calculate_normal(tri)
@@ -175,12 +250,9 @@ def render_thumbnail(
         intensity = max(0.0, min(1.0, intensity))
         
         # Transform vertices
-        v0_rot = rotate_and_project(*tri[0])
-        v1_rot = rotate_and_project(*tri[1])
-        v2_rot = rotate_and_project(*tri[2])
-        
-        # Average Z for depth sorting
-        z_avg = (v0_rot[2] + v1_rot[2] + v2_rot[2]) / 3.0
+        v0_rot = rotate_point(*tri[0])
+        v1_rot = rotate_point(*tri[1])
+        v2_rot = rotate_point(*tri[2])
         
         p0 = project_to_screen(*v0_rot)
         p1 = project_to_screen(*v1_rot)
@@ -189,18 +261,17 @@ def render_thumbnail(
         # Calculate lit color
         color = tuple(int(c * intensity) for c in mesh_color)
         
-        transformed.append((z_avg, [p0, p1, p2], color))
+        # Rasterize triangle with z-buffer
+        _rasterize_triangle(
+            p0, p1, p2,
+            color,
+            color_buffer,
+            z_buffer,
+            width, height
+        )
     
-    # Sort by depth (painter's algorithm: back to front)
-    transformed.sort(key=lambda item: item[0])
-    
-    # Create image
-    image = Image.new('RGB', (width, height), bg_color)
-    draw = ImageDraw.Draw(image)
-    
-    # Draw triangles back to front
-    for _, points, color in transformed:
-        draw.polygon(points, fill=color)
+    # Convert numpy array to PIL Image
+    image = Image.fromarray(color_buffer, 'RGB')
     
     # Convert to PNG bytes
     buffer = io.BytesIO()
