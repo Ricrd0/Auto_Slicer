@@ -636,6 +636,7 @@ def _run_orca(
         should_cancel=should_cancel,
         on_start=on_process_start,
         on_finish=on_process_finish,
+        use_xvfb=True,
     )
     if code != 0 or not archive.is_file() or archive.stat().st_size == 0:
         raise EngineError(tail or f"OrcaSlicer exited with status {code}")

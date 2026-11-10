@@ -45,6 +45,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libgtk-3-0t64 \
         libmspack0t64 \
         libwebkit2gtk-4.1-0 \
+        xvfb \
+        libgl1-mesa-dri \
+        libegl1 \
+        libxrender1 \
+        libxext6 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /tmp/orca
